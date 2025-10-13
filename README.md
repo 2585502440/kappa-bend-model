@@ -32,24 +32,24 @@ End-to-end pipeline that learns **tip angle** and **full curvature shape κ(s)**
 <table>
   <tr>
     <td align="center">
-      <img src="examples/r5_T20_xy_from_theta.png" alt="r5_T20_xy_from_theta" width="180"><br/>
-      <sub>ratio = 5:1 · temp = 20 °C</sub>
+      <img src="examples/r6_T20_xy_from_theta.png" alt="r5_T20_xy_from_theta" width="180"><br/>
+      <sub>ratio = 6:1 · temp = 20 °C</sub>
     </td>
     <td align="center">
-      <img src="examples/r5_T30_xy_from_theta.png" alt="r5_T30_xy_from_theta" width="180"><br/>
-      <sub>ratio = 5:1 · temp = 30 °C</sub>
+      <img src="examples/r6_T30_xy_from_theta.png" alt="r5_T30_xy_from_theta" width="180"><br/>
+      <sub>ratio = 6:1 · temp = 30 °C</sub>
     </td>
     <td align="center">
-      <img src="examples/r5_T40_xy_from_theta.png" alt="r5_T40_xy_from_theta" width="180"><br/>
-      <sub>ratio = 5:1 · temp = 40 °C</sub>
+      <img src="examples/r6_T40_xy_from_theta.png" alt="r5_T40_xy_from_theta" width="180"><br/>
+      <sub>ratio = 6:1 · temp = 40 °C</sub>
     </td>
     <td align="center">
-      <img src="examples/r5_T50_xy_from_theta.png" alt="r5_T50_xy_from_theta" width="180"><br/>
-      <sub>ratio = 5:1 · temp = 50 °C</sub>
+      <img src="examples/r6_T50_xy_from_theta.png" alt="r5_T50_xy_from_theta" width="180"><br/>
+      <sub>ratio = 6:1 · temp = 50 °C</sub>
     </td>
     <td align="center">
-      <img src="examples/r5_T60_xy_from_theta.png" alt="r5_T60_xy_from_theta" width="180"><br/>
-      <sub>ratio = 5:1 · temp = 60 °C</sub>
+      <img src="examples/r6_T60_xy_from_theta.png" alt="r5_T60_xy_from_theta" width="180"><br/>
+      <sub>ratio = 6:1 · temp = 60 °C</sub>
     </td>
   </tr>
 </table>
