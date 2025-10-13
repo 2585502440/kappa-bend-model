@@ -7,4 +7,4 @@ The model learns data from train files. The excel contains curveture of material
 
 After training the model, it can predict other ratio and temperature.
 
-<img width="0" height="50" alt="r5_T20_xy_from_theta" src="https://github.com/user-attachments/assets/a2ba44c5-6fa6-4b34-8986-be3d0a833ff0" />
+<img width="50" height="50" alt="r5_T20_xy_from_theta" src="https://github.com/user-attachments/assets/a2ba44c5-6fa6-4b34-8986-be3d0a833ff0" />
