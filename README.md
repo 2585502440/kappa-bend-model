@@ -53,3 +53,18 @@ End-to-end pipeline that learns **tip angle** and **full curvature shape κ(s)**
     </td>
   </tr>
 </table>
+
+## Third-party Article Reuse Notice 
+
+Parts of this repository reuse or adapt figures and digitized curves from:
+**Yongqing Xia, Yaru Meng, Ronghua Yu, Ziqi Teng, Jie Zhou, Shengjie Wang (2023)**,  
+*Bio-Inspired Hydrogel–Elastomer Actuator with Bidirectional Bending and Dynamic Structural Color*, **Molecules** 28(19):6752.  
+DOI: https://doi.org/10.3390/molecules28196752
+
+The article is distributed under the **Creative Commons Attribution 4.0 International (CC BY 4.0)** license:  
+https://creativecommons.org/licenses/by/4.0/
+
+**Reuse in this repository complies with CC BY 4.0**. Unless otherwise noted, reused items are **adapted/digitized and replotted** (e.g., cropping, digitization, smoothing, relabeling).  
+Credit line example: *“Adapted from Xia et al., Molecules 28 (2023) 6752, CC BY 4.0. Changes: digitization and replotting.”*  
+No endorsement by the original authors is implied.
+
