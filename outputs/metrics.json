@@ -1,0 +1,38 @@
+{
+  "PolyLinear": {
+    "cv_best_params": {},
+    "cv_best_mae": 39.20534606789557,
+    "test_r2": 0.8878280673011537,
+    "test_rmse": 50.237454609365614,
+    "test_mae": 45.20724930205063,
+    "n_train": 10,
+    "n_test": 5
+  },
+  "RandomForest": {
+    "cv_best_params": {
+      "reg__max_depth": null,
+      "reg__min_samples_leaf": 1,
+      "reg__n_estimators": 300
+    },
+    "cv_best_mae": 92.44181651736139,
+    "test_r2": 0.8080426463182505,
+    "test_rmse": 65.71853937903174,
+    "test_mae": 55.68186002085523,
+    "n_train": 10,
+    "n_test": 5
+  },
+  "GradBoost": {
+    "cv_best_params": {
+      "reg__learning_rate": 0.1,
+      "reg__max_depth": 4,
+      "reg__n_estimators": 800,
+      "reg__subsample": 0.8
+    },
+    "cv_best_mae": 88.15649711823987,
+    "test_r2": 0.7665254649301068,
+    "test_rmse": 72.47784719796448,
+    "test_mae": 62.11768124031564,
+    "n_train": 10,
+    "n_test": 5
+  }
+}
