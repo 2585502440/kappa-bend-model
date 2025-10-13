@@ -27,7 +27,7 @@ End-to-end pipeline that learns **tip angle** and **full curvature shape κ(s)**
 - Recommended columns: `Point Curvature (um-1)`, `Point Curvature Sign`, `X-Coordinate`, `Y-Coordinate`.
 - Folder/file names should include tokens like `5vs1` (ratio 5:1) and `20C` (temperature 20 °C).
 
-## Examples
+## Prediction Examples
 
 <table>
   <tr>
