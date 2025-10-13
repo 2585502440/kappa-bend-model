@@ -27,3 +27,29 @@ End-to-end pipeline that learns **tip angle** and **full curvature shape κ(s)**
 - Recommended columns: `Point Curvature (um-1)`, `Point Curvature Sign`, `X-Coordinate`, `Y-Coordinate`.
 - Folder/file names should include tokens like `5vs1` (ratio 5:1) and `20C` (temperature 20 °C).
 
+## Examples
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="examples/r5_T20_xy_from_theta.png" alt="r5_T20_xy_from_theta" width="180"><br/>
+      <sub>ratio = 5:1 · temp = 20 °C</sub>
+    </td>
+    <td align="center">
+      <img src="examples/r5_T30_xy_from_theta.png" alt="r5_T30_xy_from_theta" width="180"><br/>
+      <sub>ratio = 5:1 · temp = 30 °C</sub>
+    </td>
+    <td align="center">
+      <img src="examples/r5_T40_xy_from_theta.png" alt="r5_T40_xy_from_theta" width="180"><br/>
+      <sub>ratio = 5:1 · temp = 40 °C</sub>
+    </td>
+    <td align="center">
+      <img src="examples/r5_T50_xy_from_theta.png" alt="r5_T50_xy_from_theta" width="180"><br/>
+      <sub>ratio = 5:1 · temp = 50 °C</sub>
+    </td>
+    <td align="center">
+      <img src="examples/r5_T60_xy_from_theta.png" alt="r5_T60_xy_from_theta" width="180"><br/>
+      <sub>ratio = 5:1 · temp = 60 °C</sub>
+    </td>
+  </tr>
+</table>
