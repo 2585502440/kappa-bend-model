@@ -1,38 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-End-to-end training pipeline for predicting final bending angle θ_tip (deg)
-from PNIPAM:PDMS ratio r and temperature T (°C), PLUS an additional
-curvature-shape modeling branch (PCA + regression) that enables predicting
-an entire curvature profile κ(s) during inference.
+PNIPAM:PDMS bending — training-only pipeline with paper-friendly baseline summaries
 
-UPDATED:
-- Train step now also saves parity plots for TRAIN, TEST, and ALL (train+test).
-- After training curvature-shape models, the script automatically generates full
-  θ(s) curves for every (ratio, temp) that appears in your dataset:
-    outputs/theta_curves/figs/*.png and outputs/theta_curves/csv/*.csv
-- A CLI subcommand `predict_curve` remains available for ad-hoc θ(s) generation.
+What this script does
+---------------------
+- Train θ_tip (deg) model from (ratio, temperature) and evaluate on a held-out test set.
+- Train curvature-shape branch (PCA + regressors) to enable θ(s) auto-generation after training.
+- Compute two geometry baselines under unified preprocessing:
+    (1) Chord–Sagitta (constant κ), (2) Polyline-κ (curvature from resampled XY).
+- Save the usual figures (parity/residual/learning curve/robustness/response surface).
+- NEW: Paper-friendly summaries under outputs/paper/:
+    1) baseline_mae_ci.png — MAE with 95% bootstrap CIs (same test set for both baselines; optional ML).
+    2) baseline_parity_combined.png — both baselines on one parity axis (truth vs prediction).
+    3) baseline_theta_delta_ci.png — mean ± 95% band of [θ_baseline(s) − θ_ref(s)] over s∈[0,1],
+       aggregated across all available files (unit-consistent).
+    All underlying arrays are exported to CSV/JSON for reproducibility.
 
-Data assumption:
-- Each file (CSV/XLSX) corresponds to ONE specimen at ONE ratio & ONE temperature.
-- The file contains a curvature series; preferred columns:
-    "Point Curvature (um-1)" and "Point Curvature Sign" (+/-1).
-  X/Y coordinates are used to reconstruct arc-length s; otherwise unit spacing.
+Inputs & calibration
+--------------------
+- Place your files under data_root/train/ and data_root/test/.
+- CSV/XLSX should contain either curvature columns ("Point Curvature", optional "Sign") and/or XY columns.
+- XY is always converted to μm first (unit-consistent). Pixel size is auto-inferred if possible; otherwise
+  a global fallback UM_PER_PX is used (set via --um_per_px).
 
-Outputs (under ./outputs by default):
-  - dataset_*_clean.csv, best_model.joblib, metrics.json
-  - figures/: parity_train.png, parity_test.png, parity_all.png,
-              residual_*.png, learning_curve.png,
-              feature_importance.png, response_surface.png,
-              robustness_r{1,3,5}.png
-  - curvature_pca.joblib, curvature_reg.joblib, length_model.joblib, curvature_meta.json
-  - theta_curves/csv/*.csv, theta_curves/figs/*.png  (auto-generated after train)
+Usage
+-----
+python try.py --data_root <folder with train/ and test/> --out_dir <outputs/> --um_per_px 0.62
 """
 
 from __future__ import annotations
-import argparse
-import json
-import math
-import re
+import argparse, json, math, re
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
@@ -52,56 +49,65 @@ from sklearn.decomposition import PCA
 from sklearn.multioutput import MultiOutputRegressor
 import joblib
 
-
-# ------------------- Tunables -------------------
+# ----------------------- Tunables -----------------------
 RANDOM_SEED = 42
 N_FOLDS = 5
 
-# Input tolerance (for robustness plots)
-TOL_TEMP_STD = 0.5   # °C (std. dev.)
-TOL_RATIO_STD = 0.1  # absolute std. dev. of r
+TOL_TEMP_STD = 0.5
+TOL_RATIO_STD = 0.1
 N_MONTE_CARLO = 2000
 
-# Response surface grid
 GRID_T_MIN, GRID_T_MAX, GRID_T_STEP = 20, 60, 1
 GRID_R_MIN, GRID_R_MAX, GRID_R_STEP = 1.0, 5.0, 0.05
 
-# Curvature shape model resampling
-N_POINTS_CURV = 200   # number of resampled points along normalized arc-length [0..1]
+N_POINTS_CURV = 200          # resampling points for curvature/θ(s)
+N_POINTS_BASELINE = 400      # resampling points for XY-based baselines
 
-# ------------------- Paths -------------------
+# Global pixel→micron fallback (μm/px) used only if not found in files
+UM_PER_PX = 1.0
+
+# Bootstrap settings for paper figures
+N_BOOT = 10000
+ALPHA = 0.05
+
+# ----------------------- Paths -----------------------
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT
 TRAIN_DIR = DATA_ROOT / "train"
 TEST_DIR  = DATA_ROOT / "test"
 OUT_DIR   = ROOT / "outputs"
 FIG_DIR   = OUT_DIR / "figures"
+OUT_DIR.mkdir(exist_ok=True); FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-OUT_DIR.mkdir(exist_ok=True)
-FIG_DIR.mkdir(parents=True, exist_ok=True)
+# Paper-friendly outputs (figures + csv)
+PAPER_FIG_DIR = OUT_DIR / "paper" / "figs"
+PAPER_CSV_DIR = OUT_DIR / "paper" / "csv"
+PAPER_FIG_DIR.mkdir(parents=True, exist_ok=True)
+PAPER_CSV_DIR.mkdir(parents=True, exist_ok=True)
 
-# Regex helpers
 _ratio_re = re.compile(r"(\d+)\s*vs\s*(\d+)", re.IGNORECASE)
 _temp_re  = re.compile(r"(\d+)\s*C", re.IGNORECASE)
 
-
-# ------------------- Small utilities -------------------
+# ----------------------- Small IO utils -----------------------
 def configure_paths(data_root: Optional[str], out_dir: Optional[str]) -> None:
-    global DATA_ROOT, TRAIN_DIR, TEST_DIR, OUT_DIR, FIG_DIR
+    """Set data/output directories at runtime."""
+    global DATA_ROOT, TRAIN_DIR, TEST_DIR, OUT_DIR, FIG_DIR, PAPER_FIG_DIR, PAPER_CSV_DIR
     if data_root:
         DATA_ROOT = Path(data_root).resolve()
+        TRAIN_DIR = DATA_ROOT / "train"; TEST_DIR = DATA_ROOT / "test"
         print(f"[INFO] Using data_root = {DATA_ROOT}")
-        TRAIN_DIR = DATA_ROOT / "train"
-        TEST_DIR  = DATA_ROOT / "test"
     if out_dir:
         OUT_DIR = Path(out_dir).resolve()
         print(f"[INFO] Using out_dir = {OUT_DIR}")
     FIG_DIR = OUT_DIR / "figures"
-    OUT_DIR.mkdir(exist_ok=True)
-    FIG_DIR.mkdir(parents=True, exist_ok=True)
-
+    OUT_DIR.mkdir(exist_ok=True); FIG_DIR.mkdir(parents=True, exist_ok=True)
+    PAPER_FIG_DIR = OUT_DIR / "paper" / "figs"
+    PAPER_CSV_DIR = OUT_DIR / "paper" / "csv"
+    PAPER_FIG_DIR.mkdir(parents=True, exist_ok=True)
+    PAPER_CSV_DIR.mkdir(parents=True, exist_ok=True)
 
 def _read_table(path: Path) -> pd.DataFrame:
+    """Read CSV/XLSX with a few fallback encodings."""
     if path.suffix.lower() in [".xlsx", ".xls"]:
         return pd.read_excel(path)
     for enc in ("utf-8-sig", "utf-8", "gbk", "latin-1"):
@@ -111,8 +117,8 @@ def _read_table(path: Path) -> pd.DataFrame:
             continue
     return pd.read_csv(path)
 
-
 def _find_col_like(df: pd.DataFrame, keys: List[str]) -> Optional[str]:
+    """Find the first column whose lowercase name contains any of the keys."""
     low = {c.lower(): c for c in df.columns}
     for k in keys:
         for lc, orig in low.items():
@@ -120,19 +126,85 @@ def _find_col_like(df: pd.DataFrame, keys: List[str]) -> Optional[str]:
                 return orig
     return None
 
-
 def _cumtrapz(y: np.ndarray, x: np.ndarray) -> np.ndarray:
-    y = np.asarray(y, float)
-    x = np.asarray(x, float)
-    if len(y) < 2:
-        return np.zeros_like(y)
-    dx = np.diff(x)
-    mid = 0.5 * (y[1:] + y[:-1]) * dx
-    out = np.zeros_like(y, float)
-    out[1:] = np.cumsum(mid)
+    """Vectorized cumulative trapezoidal integral."""
+    y = np.asarray(y, float); x = np.asarray(x, float)
+    if len(y) < 2: return np.zeros_like(y)
+    dx = np.diff(x); mid = 0.5 * (y[1:] + y[:-1]) * dx
+    out = np.zeros_like(y, float); out[1:] = np.cumsum(mid)
     return out
 
+def _trapz_safe(y: np.ndarray, x: np.ndarray) -> float:
+    """Safe trapezoid area (NumPy ≥1.26 uses trapezoid)."""
+    try:    return float(np.trapezoid(y, x))
+    except AttributeError: return float(np.trapz(y, x))
 
+def _interp_fill_nans(v: np.ndarray) -> np.ndarray:
+    """Linear interpolate to fill NaNs, keep length unchanged."""
+    v = np.asarray(v, float); idx = np.flatnonzero(np.isfinite(v))
+    if len(idx) == 0: return np.zeros_like(v)
+    return np.interp(np.arange(len(v)), idx, v[idx])
+
+# ----------------------- Calibration helpers -----------------------
+def _str_has_um(s: str) -> bool:
+    s = s.lower()
+    return ("um" in s) or ("µm" in s)
+
+def _infer_um_per_px_from_df(df: pd.DataFrame) -> Optional[float]:
+    """Try to infer μm/px from typical column names or inline strings."""
+    cand_cols = [c for c in df.columns if any(k in c.lower() for k in
+                   ["um per pixel", "um/pixel", "pixel size", "scale", "calibration", "um_per_px"])]
+    for c in cand_cols:
+        try:
+            vals = pd.to_numeric(df[c], errors="coerce").dropna()
+            if len(vals):
+                v = float(vals.iloc[0])
+                if np.isfinite(v) and v > 0: return v
+        except Exception:
+            pass
+    if len(df) > 0:
+        first_row = " ".join(str(x) for x in df.iloc[0].tolist())
+        m = re.search(r"([\d.]+)\s*(um|µm)\s*/\s*(px|pixel)", first_row, re.I)
+        if m:
+            v = float(m.group(1))
+            if v > 0: return v
+    return None
+
+def _get_xy_in_um(df: pd.DataFrame) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], float, bool]:
+    """Return XY in microns (x_um,y_um), along with scale (μm/px) and a boolean telling if XY already in μm."""
+    x_col = _find_col_like(df, ["x-coordinate", "x (", "x)", " x", "x_um", "x"])
+    y_col = _find_col_like(df, ["y-coordinate", "y (", "y)", " y", "y_um", "y"])
+    if x_col is None or y_col is None:
+        return None, None, 1.0, False
+
+    x = pd.to_numeric(df[x_col], errors="coerce").to_numpy()
+    y = pd.to_numeric(df[y_col], errors="coerce").to_numpy()
+    x = _interp_fill_nans(x); y = _interp_fill_nans(y)
+
+    if _str_has_um(x_col) or _str_has_um(y_col):
+        return x, y, 1.0, True
+
+    scale = _infer_um_per_px_from_df(df)
+    if scale is None: scale = UM_PER_PX
+    if scale <= 0: scale = 1.0
+    return x * scale, y * scale, scale, False
+
+def _arc_length(x_um: np.ndarray, y_um: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return cumulative arc length s and segment lengths ds (both in μm)."""
+    ds = np.hypot(np.diff(x_um), np.diff(y_um))
+    s = np.r_[0.0, np.cumsum(ds)]
+    return s, np.r_[ds, ds[-1] if len(ds) else 0.0]
+
+def _resample_equal_s(x_um: np.ndarray, y_um: np.ndarray, N: int = N_POINTS_BASELINE) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Resample XY to equal arc-length spacing for stable curvature estimation."""
+    s, _ = _arc_length(x_um, y_um)
+    if s[-1] <= 0: s = np.arange(len(x_um), dtype=float)
+    s_new = np.linspace(s[0], s[-1], max(2, N))
+    x_new = np.interp(s_new, s, x_um)
+    y_new = np.interp(s_new, s, y_um)
+    return x_new, y_new, s_new
+
+# ----------------------- Parsing helpers -----------------------
 def parse_ratio_from_path(path: Path) -> Optional[float]:
     m = _ratio_re.search(str(path))
     if m:
@@ -149,7 +221,6 @@ def parse_ratio_from_path(path: Path) -> Optional[float]:
             return a / b if b else None
     return None
 
-
 def parse_temp_from_path(path: Path) -> Optional[float]:
     m = _temp_re.search(path.name)
     if m: return float(m.group(1))
@@ -158,12 +229,11 @@ def parse_temp_from_path(path: Path) -> Optional[float]:
         if m: return float(m.group(1))
     return None
 
-
+# ----------------------- Tip angle & baselines (unit-consistent) -----------------------
 def integrate_tip_angle(df: pd.DataFrame) -> Dict[str, float]:
+    """Integrate κ(s) to get θ_tip (deg); s is always in μm."""
     k_point = _find_col_like(df, ["point curvature"])
     sign_c  = _find_col_like(df, ["point curvature sign", "sign"])
-    x_col   = _find_col_like(df, ["x-coordinate", "x (", "x)", " x"])
-    y_col   = _find_col_like(df, ["y-coordinate", "y (", "y)", " y"])
 
     if k_point is not None:
         kappa = pd.to_numeric(df[k_point], errors="coerce").to_numpy()
@@ -173,10 +243,8 @@ def integrate_tip_angle(df: pd.DataFrame) -> Dict[str, float]:
             if nz.any():
                 last = -1
                 for i in range(len(sign)):
-                    if nz[i]:
-                        last = i
-                    elif last >= 0:
-                        sign[i] = np.sign(sign[last])
+                    if nz[i]: last = i
+                    elif last >= 0: sign[i] = np.sign(sign[last])
                 if last < 0:
                     sign[:] = 1.0
             else:
@@ -184,273 +252,63 @@ def integrate_tip_angle(df: pd.DataFrame) -> Dict[str, float]:
             kappa = kappa * np.sign(sign)
     else:
         k_avg = _find_col_like(df, ["average curvature", "curvature"])
-        if k_avg is None:
-            raise ValueError("No curvature column found.")
+        if k_avg is None: raise ValueError("No curvature column found.")
         kappa = pd.to_numeric(df[k_avg], errors="coerce").to_numpy()
 
-    if x_col is not None and y_col is not None:
-        x = pd.to_numeric(df[x_col], errors="coerce").to_numpy()
-        y = pd.to_numeric(df[y_col], errors="coerce").to_numpy()
-
-        def _interp(v):
-            idx = np.flatnonzero(np.isfinite(v))
-            if len(idx) == 0: return np.zeros_like(v)
-            return np.interp(np.arange(len(v)), idx, v[idx])
-
-        x = _interp(x)
-        y = _interp(y)
-        ds = np.sqrt(np.diff(x)**2 + np.diff(y)**2)
+    # s in μm (from XY if available, otherwise uniform spacing scaled by UM_PER_PX)
+    x_um, y_um, _, _ = _get_xy_in_um(df)
+    if x_um is not None and y_um is not None:
+        ds = np.sqrt(np.diff(x_um)**2 + np.diff(y_um)**2)
         s  = np.concatenate([[0.0], np.cumsum(ds)])
     else:
-        s = np.arange(len(kappa), dtype=float)
+        s = np.arange(len(kappa), dtype=float) * UM_PER_PX
 
     mask = np.isfinite(kappa) & np.isfinite(s)
     kappa = kappa[mask]; s = s[mask]
-    if len(s) < 3:
-        raise ValueError("Too few valid points to integrate.")
+    if len(s) < 3: raise ValueError("Too few valid points to integrate.")
 
     theta_rad = _cumtrapz(kappa, s)
     tip_angle_deg = float(np.degrees(theta_rad[-1]))
     L = float(s[-1] - s[0])
-    mean_kappa = float(np.trapz(kappa, s) / max(L, 1e-9))
+    mean_kappa = _trapz_safe(kappa, s) / max(L, 1e-9)
     max_abs_kappa = float(np.nanmax(np.abs(kappa)))
     return dict(tip_angle_deg=tip_angle_deg, L=L,
-                mean_kappa=mean_kappa, max_abs_kappa=max_abs_kappa)
+                mean_kappa=float(mean_kappa), max_abs_kappa=max_abs_kappa)
 
+def _polyline_kappa_from_xy(x_um: np.ndarray, y_um: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute curvature along polyline sampled at equal arc-length spacing (units 1/μm)."""
+    s, _ = _arc_length(x_um, y_um)
+    if not np.all(np.diff(s) > 0):
+        s = s + np.linspace(0, 1e-9, len(s))
+    dx = np.gradient(x_um, s); dy = np.gradient(y_um, s)
+    ddx = np.gradient(dx, s);  ddy = np.gradient(dy, s)
+    denom = np.power(dx * dx + dy * dy, 1.5)
+    denom[denom == 0] = np.finfo(float).eps
+    kappa = (dx * ddy - dy * ddx) / denom
+    return kappa, s
 
-def collect_dataset(split_dir: Path, split_name: str) -> pd.DataFrame:
-    rows = []
-    n_total, n_ok = 0, 0
-    for path in list(split_dir.rglob("*.csv")) + list(split_dir.rglob("*.xlsx")):
-        n_total += 1
-        try:
-            df = _read_table(path)
-            feats = integrate_tip_angle(df)
-            ratio = parse_ratio_from_path(path)
-            temp  = parse_temp_from_path(path)
-            if ratio is None or temp is None:
-                print(f"[WARN] Skip (cannot parse ratio/temp): {path}")
-                continue
-            rows.append({
-                "split": split_name,
-                "specimen": "/".join(path.parts[-3:]),
-                "ratio": float(ratio),
-                "ratio_frac": float(ratio/(1.0+ratio)),
-                "temp_C": float(temp),
-                **feats,
-                "file": str(path)
-            })
-            n_ok += 1
-        except Exception as e:
-            print(f"[ERROR] Read failed: {path} -> {e}")
-    df = pd.DataFrame(rows)
-    print(f"[INFO] {split_name}: found {n_total} files, loaded {n_ok} usable samples.")
-    return df
+def _baseline_chord_theta_deg(x_um: np.ndarray, y_um: np.ndarray) -> float:
+    """Chord–Sagitta θ_tip estimate (constant κ circular arc) with sign from sagitta orientation."""
+    x0, y0 = x_um[0], y_um[0]; x1, y1 = x_um[-1], y_um[-1]
+    vx, vy = x1 - x0, y1 - y0
+    c = float(np.hypot(vx, vy))
+    if c <= 0: return 0.0
+    cross = (x_um - x0) * vy - (y_um - y0) * vx
+    dist = np.abs(cross) / c
+    idx = int(np.argmax(dist)); h = float(np.sign(cross[idx]) * dist[idx])
+    if np.isclose(h, 0.0): return 0.0
+    R = (c * c) / (8.0 * h) + 0.5 * h
+    arg = min(1.0, max(0.0, c / (2.0 * abs(R))))
+    theta = 2.0 * np.arcsin(arg)
+    return float(np.degrees(np.sign(h) * theta))
 
-
-# ------------------- Plots -------------------
-def _save_metrics(all_metrics: Dict[str, dict]) -> None:
-    with open(OUT_DIR / "metrics.json", "w", encoding="utf-8") as f:
-        json.dump(all_metrics, f, indent=2, ensure_ascii=False)
-
-
-def _parity_residual(y_true: np.ndarray, y_pred: np.ndarray, tag: str) -> None:
-    # Parity
-    plt.figure(figsize=(5, 5))
-    lims = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
-    plt.plot(lims, lims, '--', lw=1)
-    plt.scatter(y_true, y_pred, alpha=0.9)
-    plt.xlabel("True θ_tip (deg)")
-    plt.ylabel("Predicted θ_tip (deg)")
-    plt.title(f"Parity plot ({tag})")
-    plt.tight_layout()
-    plt.savefig(FIG_DIR / f"parity_{tag}.png", dpi=300)
-    plt.close()
-
-    # Residual
-    resid = y_pred - y_true
-    plt.figure(figsize=(5, 4))
-    plt.axhline(0, ls="--", lw=1)
-    plt.scatter(y_pred, resid, alpha=0.9)
-    plt.xlabel("Predicted θ_tip (deg)")
-    plt.ylabel("Residual (pred - true)")
-    plt.title(f"Residual vs Pred ({tag})")
-    plt.tight_layout()
-    plt.savefig(FIG_DIR / f"residual_{tag}.png", dpi=300)
-    plt.close()
-
-
-def _learning_curve(estimator: Pipeline, X: pd.DataFrame, y: pd.Series) -> None:
-    sizes, tr_scores, cv_scores = learning_curve(
-        estimator, X, y,
-        cv=min(N_FOLDS, max(2, len(y)//2)),
-        scoring="neg_mean_absolute_error",
-        n_jobs=-1, random_state=RANDOM_SEED
-    )
-    plt.figure(figsize=(6, 4))
-    plt.plot(sizes, -tr_scores.mean(1), 'o-', label="Train MAE")
-    plt.plot(sizes, -cv_scores.mean(1), 'o-', label="CV MAE")
-    plt.xlabel("Training Samples")
-    plt.ylabel("MAE (deg)")
-    plt.title("Learning Curve")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(FIG_DIR / "learning_curve.png", dpi=300)
-    plt.close()
-
-
-def _importance(estimator: Pipeline, X: pd.DataFrame, y: pd.Series, names: List[str]) -> None:
-    r = permutation_importance(estimator, X, y, n_repeats=20, random_state=RANDOM_SEED, n_jobs=-1)
-    imp, std = r.importances_mean, r.importances_std
-    idx = np.argsort(imp)[::-1]
-    plt.figure(figsize=(6, 4))
-    plt.bar(range(len(names)), imp[idx], yerr=std[idx])
-    plt.xticks(range(len(names)), [names[i] for i in idx])
-    plt.ylabel("Permutation importance (ΔMAE)")
-    plt.title("Input importance")
-    plt.tight_layout()
-    plt.savefig(FIG_DIR / "feature_importance.png", dpi=300)
-    plt.close()
-
-
-def _response_surface(model: Pipeline) -> None:
-    Ts = np.arange(GRID_T_MIN, GRID_T_MAX + GRID_T_STEP, GRID_T_STEP)
-    Rs = np.arange(GRID_R_MIN, GRID_R_MAX + GRID_R_STEP, GRID_R_STEP)
-    TT, RR = np.meshgrid(Ts, Rs)
-    df = pd.DataFrame({
-        "ratio": RR.ravel(),
-        "ratio_frac": (RR/(1.0+RR)).ravel(),
-        "temp_C": TT.ravel()
-    })
-    Z = model.predict(df).reshape(RR.shape)
-    plt.figure(figsize=(6.3, 4.8))
-    cs = plt.contourf(TT, RR, Z, levels=24)
-    plt.colorbar(cs, label="Predicted θ_tip (deg)")
-    plt.xlabel("Temperature (°C)")
-    plt.ylabel("r = PNIPAM:PDMS")
-    plt.title("Response surface of θ_tip")
-    plt.tight_layout()
-    plt.savefig(FIG_DIR / "response_surface.png", dpi=300)
-    plt.close()
-
-
-def _robustness(model: Pipeline) -> None:
-    Ts = np.arange(GRID_T_MIN, GRID_T_MAX + 1, 1)
-    for r_nom in [1.0, 3.0, 5.0]:
-        means, stds = [], []
-        for T_nom in Ts:
-            T = np.random.normal(T_nom, TOL_TEMP_STD, size=N_MONTE_CARLO)
-            R = np.random.normal(r_nom, TOL_RATIO_STD, size=N_MONTE_CARLO)
-            df = pd.DataFrame({"ratio": R, "ratio_frac": R/(1.0+R), "temp_C": T})
-            y = model.predict(df)
-            means.append(y.mean())
-            stds.append(y.std())
-        means = np.array(means); stds = np.array(stds)
-        plt.figure(figsize=(6, 4))
-        plt.plot(Ts, means, label=f"r={r_nom}")
-        plt.fill_between(Ts, means - stds, means + stds, alpha=0.3)
-        plt.xlabel("Temperature (°C)")
-        plt.ylabel("Predicted θ_tip (deg)")
-        plt.title(f"Robustness under tolerance (σ_T={TOL_TEMP_STD}°C, σ_r={TOL_RATIO_STD})")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(FIG_DIR / f"robustness_r{int(r_nom)}.png", dpi=300)
-        plt.close()
-
-
-# ------------------- Training & evaluation (θ_tip model) -------------------
-def train_and_eval(df_tr: pd.DataFrame, df_te: pd.DataFrame):
-    target = "tip_angle_deg"
-    feats = ["ratio", "ratio_frac", "temp_C"]
-
-    Xtr, ytr = df_tr[feats], df_tr[target]
-    Xte, yte = df_te[feats], df_te[target]
-
-    cv = KFold(n_splits=min(N_FOLDS, max(2, len(df_tr)//2)),
-               shuffle=True, random_state=RANDOM_SEED)
-
-    candidates = []
-
-    # (1) Polynomial + Linear regression (degree=2)
-    poly = Pipeline([
-        ("ct", ColumnTransformer([("num", "passthrough", feats)])),
-        ("poly", PolynomialFeatures(degree=2, include_bias=False)),
-        ("sc", StandardScaler()),
-        ("reg", LinearRegression())
-    ])
-    candidates.append(("PolyLinear", poly, {}))
-
-    # (2) RandomForest
-    rf = Pipeline([
-        ("ct", ColumnTransformer([("num", "passthrough", feats)])),
-        ("reg", RandomForestRegressor(random_state=RANDOM_SEED))
-    ])
-    grid_rf = {"reg__n_estimators": [300, 600],
-               "reg__max_depth": [None, 6, 10],
-               "reg__min_samples_leaf": [1, 2, 4]}
-    candidates.append(("RandomForest", rf, grid_rf))
-
-    # (3) GradientBoosting
-    gbr = Pipeline([
-        ("ct", ColumnTransformer([("num", "passthrough", feats)])),
-        ("reg", GradientBoostingRegressor(random_state=RANDOM_SEED))
-    ])
-    grid_gbr = {"reg__n_estimators": [400, 800],
-                "reg__learning_rate": [0.05, 0.1],
-                "reg__max_depth": [2, 3, 4],
-                "reg__subsample": [0.8, 1.0]}
-    candidates.append(("GradBoost", gbr, grid_gbr))
-
-    best_name, best_model, best_metrics = None, None, None
-    all_metrics: Dict[str, dict] = {}
-
-    for name, pipe, grid in candidates:
-        gs = GridSearchCV(pipe, grid, scoring="neg_mean_absolute_error",
-                          cv=cv, n_jobs=-1, verbose=0)
-        gs.fit(Xtr, ytr)
-        y_pred = gs.best_estimator_.predict(Xte)
-        m = {
-            "cv_best_params": gs.best_params_,
-            "cv_best_mae": -float(gs.best_score_),
-            "test_r2": float(r2_score(yte, y_pred)),
-            "test_rmse": float(math.sqrt(mean_squared_error(yte, y_pred))),
-            "test_mae": float(mean_absolute_error(yte, y_pred)),
-            "n_train": int(len(df_tr)),
-            "n_test": int(len(df_te))
-        }
-        all_metrics[name] = m
-        if best_metrics is None or m["test_mae"] < best_metrics["test_mae"]:
-            best_metrics, best_model, best_name = m, gs.best_estimator_, name
-
-    _save_metrics(all_metrics)
-    joblib.dump(best_model, OUT_DIR / "best_model.joblib")
-    print(f"[INFO] Best model: {best_name}")
-    print(json.dumps(best_metrics, indent=2, ensure_ascii=False))
-
-    # Plots
-    _parity_residual(ytr.to_numpy(), best_model.predict(Xtr), "train")
-    _parity_residual(yte.to_numpy(), best_model.predict(Xte), "test")
-
-    # NEW: parity on ALL samples (train+test)
-    Xall = pd.concat([Xtr, Xte], ignore_index=True)
-    yall = pd.concat([ytr, yte], ignore_index=True)
-    _parity_residual(yall.to_numpy(), best_model.predict(Xall), "all")
-
-    _learning_curve(best_model, Xall, yall)
-    _importance(best_model, Xtr, ytr, feats)
-    _response_surface(best_model)
-    _robustness(best_model)
-
-    return best_model, all_metrics
-
-
-# ------------------- Curvature shape models (PCA + regression) -------------------
-def _signed_kappa_and_s(df: pd.DataFrame):
+def _extract_xy_kappa(df: pd.DataFrame) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    """Return (x_um, y_um, kappa_if_present)."""
+    x_um, y_um, _, _ = _get_xy_in_um(df)
     k_point = _find_col_like(df, ["point curvature"])
+    k_avg   = _find_col_like(df, ["average curvature", "curvature"])
     sign_c  = _find_col_like(df, ["point curvature sign", "sign"])
-    x_col   = _find_col_like(df, ["x-coordinate", "x (", "x)", " x"])
-    y_col   = _find_col_like(df, ["y-coordinate", "y (", "y)", " y"])
-
+    kappa = None
     if k_point is not None:
         kappa = pd.to_numeric(df[k_point], errors="coerce").to_numpy()
         if sign_c is not None:
@@ -465,47 +323,252 @@ def _signed_kappa_and_s(df: pd.DataFrame):
             else:
                 sign = np.ones_like(kappa)
             kappa = kappa * np.sign(sign)
+    elif k_avg is not None:
+        kappa = pd.to_numeric(df[k_avg], errors="coerce").to_numpy()
+    return x_um, y_um, kappa
+
+def _compute_baselines_from_file(path: Path) -> Tuple[float, float]:
+    """Return (θ_chord_deg, θ_poly_deg). If XY is unavailable/too short, return NaN."""
+    try:
+        df = _read_table(path)
+        x_um, y_um, _ = _extract_xy_kappa(df)[:3]
+        if x_um is None or y_um is None or len(x_um) < 3:
+            return float("nan"), float("nan")
+        x_rs, y_rs, _ = _resample_equal_s(x_um, y_um, N=N_POINTS_BASELINE)
+        th_chord = _baseline_chord_theta_deg(x_rs, y_rs)
+        k_poly, s_poly = _polyline_kappa_from_xy(x_rs, y_rs)
+        theta_poly = _cumtrapz(k_poly, s_poly)
+        th_poly = float(np.degrees(theta_poly[-1]))
+        return th_chord, th_poly
+    except Exception as e:
+        print(f"[WARN] Baseline failed for {path}: {e}")
+        return float("nan"), float("nan")
+
+# ----------------------- Dataset collection -----------------------
+def collect_dataset(split_dir: Path, split_name: str) -> pd.DataFrame:
+    rows, n_total, n_ok = [], 0, 0
+    for path in list(split_dir.rglob("*.csv")) + list(split_dir.rglob("*.xlsx")):
+        n_total += 1
+        try:
+            df = _read_table(path)
+            feats = integrate_tip_angle(df)
+            ratio = parse_ratio_from_path(path); temp = parse_temp_from_path(path)
+            if ratio is None or temp is None:
+                print(f"[WARN] Skip (cannot parse ratio/temp): {path}"); continue
+            th_chord, th_poly = _compute_baselines_from_file(path)
+            rows.append({
+                "split": split_name,
+                "specimen": "/".join(path.parts[-3:]),
+                "ratio": float(ratio),
+                "ratio_frac": float(ratio/(1.0+ratio)),
+                "temp_C": float(temp),
+                **feats,
+                "theta_chord_deg": th_chord,
+                "theta_poly_deg": th_poly,
+                "file": str(path)
+            }); n_ok += 1
+        except Exception as e:
+            print(f"[ERROR] Read failed: {path} -> {e}")
+    df = pd.DataFrame(rows)
+    print(f"[INFO] {split_name}: found {n_total} files, loaded {n_ok} usable samples.")
+    return df
+
+# ----------------------- Generic plotting helpers -----------------------
+def _save_json(obj: dict, name: str) -> None:
+    with open(OUT_DIR / name, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+def _parity_residual(y_true: np.ndarray, y_pred: np.ndarray, tag: str) -> None:
+    plt.figure(figsize=(5,5))
+    lims = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
+    plt.plot(lims, lims, '--', lw=1); plt.scatter(y_true, y_pred, alpha=0.9)
+    plt.xlabel("True θ_tip (deg)"); plt.ylabel("Predicted θ_tip (deg)")
+    plt.title(f"Parity plot ({tag})"); plt.tight_layout()
+    plt.savefig(FIG_DIR / f"parity_{tag}.png", dpi=300); plt.close()
+    resid = y_pred - y_true
+    plt.figure(figsize=(5,4)); plt.axhline(0, ls="--", lw=1)
+    plt.scatter(y_pred, resid, alpha=0.9)
+    plt.xlabel("Predicted θ_tip (deg)"); plt.ylabel("Residual (pred - true)")
+    plt.title(f"Residual vs Pred ({tag})"); plt.tight_layout()
+    plt.savefig(FIG_DIR / f"residual_{tag}.png", dpi=300); plt.close()
+
+def _learning_curve_plot(estimator: Pipeline, X: pd.DataFrame, y: pd.Series) -> None:
+    sizes, tr_scores, cv_scores = learning_curve(
+        estimator, X, y, cv=min(N_FOLDS, max(2, len(y)//2)),
+        scoring="neg_mean_absolute_error", n_jobs=-1
+    )
+    plt.figure(figsize=(6,4))
+    plt.plot(sizes, -tr_scores.mean(1), 'o-', label="Train MAE")
+    plt.plot(sizes, -cv_scores.mean(1), 'o-', label="CV MAE")
+    plt.xlabel("Training Samples"); plt.ylabel("MAE (deg)")
+    plt.title("Learning Curve"); plt.legend(); plt.tight_layout()
+    plt.savefig(FIG_DIR / "learning_curve.png", dpi=300); plt.close()
+
+def _importance(estimator: Pipeline, X: pd.DataFrame, y: pd.Series, names: List[str]) -> None:
+    r = permutation_importance(estimator, X, y, n_repeats=20, random_state=RANDOM_SEED, n_jobs=-1)
+    imp, std = r.importances_mean, r.importances_std; idx = np.argsort(imp)[::-1]
+    plt.figure(figsize=(6,4)); plt.bar(range(len(names)), imp[idx], yerr=std[idx])
+    plt.xticks(range(len(names)), [names[i] for i in idx])
+    plt.ylabel("Permutation importance (ΔMAE)"); plt.title("Input importance")
+    plt.tight_layout(); plt.savefig(FIG_DIR / "feature_importance.png", dpi=300); plt.close()
+
+def _response_surface(model: Pipeline) -> None:
+    Ts = np.arange(GRID_T_MIN, GRID_T_MAX + GRID_T_STEP, GRID_T_STEP)
+    Rs = np.arange(GRID_R_MIN, GRID_R_MAX + GRID_R_STEP, GRID_R_STEP)
+    TT, RR = np.meshgrid(Ts, Rs)
+    df = pd.DataFrame({"ratio": RR.ravel(), "ratio_frac": (RR/(1.0+RR)).ravel(), "temp_C": TT.ravel()})
+    Z = model.predict(df).reshape(RR.shape)
+    plt.figure(figsize=(6.3,4.8)); cs = plt.contourf(TT, RR, Z, levels=24)
+    plt.colorbar(cs, label="Predicted θ_tip (deg)")
+    plt.xlabel("Temperature (°C)"); plt.ylabel("r = PNIPAM:PDMS")
+    plt.title("Response surface of θ_tip"); plt.tight_layout()
+    plt.savefig(FIG_DIR / "response_surface.png", dpi=300); plt.close()
+
+def _robustness(model: Pipeline) -> None:
+    Ts = np.arange(GRID_T_MIN, GRID_T_MAX + 1, 1)
+    for r_nom in [1.0, 3.0, 5.0]:
+        means, stds = [], []
+        for T_nom in Ts:
+            T = np.random.normal(T_nom, TOL_TEMP_STD, size=N_MONTE_CARLO)
+            R = np.random.normal(r_nom, TOL_RATIO_STD, size=N_MONTE_CARLO)
+            df = pd.DataFrame({"ratio": R, "ratio_frac": R/(1.0+R), "temp_C": T})
+            y = model.predict(df); means.append(y.mean()); stds.append(y.std())
+        means, stds = np.array(means), np.array(stds)
+        plt.figure(figsize=(6,4))
+        plt.plot(Ts, means, label=f"r={r_nom}")
+        plt.fill_between(Ts, means-stds, means+stds, alpha=0.3)
+        plt.xlabel("Temperature (°C)"); plt.ylabel("Predicted θ_tip (deg)")
+        plt.title(f"Robustness (σ_T={TOL_TEMP_STD}°C, σ_r={TOL_RATIO_STD})")
+        plt.legend(); plt.tight_layout()
+        plt.savefig(FIG_DIR / f"robustness_r{int(r_nom)}.png", dpi=300); plt.close()
+
+# ----------------------- Train & eval (θ_tip) -----------------------
+def train_and_eval(df_tr: pd.DataFrame, df_te: pd.DataFrame):
+    target = "tip_angle_deg"; feats = ["ratio", "ratio_frac", "temp_C"]
+    Xtr, ytr = df_tr[feats], df_tr[target]; Xte, yte = df_te[feats], df_te[target]
+    cv = KFold(n_splits=min(N_FOLDS, max(2, len(df_tr)//2)), shuffle=True, random_state=RANDOM_SEED)
+    candidates = []
+
+    poly = Pipeline([("ct", ColumnTransformer([("num", "passthrough", feats)])),
+                     ("poly", PolynomialFeatures(degree=2, include_bias=False)),
+                     ("sc", StandardScaler()), ("reg", LinearRegression())])
+    candidates.append(("PolyLinear", poly, {}))
+
+    rf = Pipeline([("ct", ColumnTransformer([("num", "passthrough", feats)])),
+                   ("reg", RandomForestRegressor(random_state=RANDOM_SEED))])
+    grid_rf = {"reg__n_estimators":[300,600], "reg__max_depth":[None,6,10], "reg__min_samples_leaf":[1,2,4]}
+    candidates.append(("RandomForest", rf, grid_rf))
+
+    gbr = Pipeline([("ct", ColumnTransformer([("num", "passthrough", feats)])),
+                    ("reg", GradientBoostingRegressor(random_state=RANDOM_SEED))])
+    grid_gbr = {"reg__n_estimators":[400,800], "reg__learning_rate":[0.05,0.1],
+                "reg__max_depth":[2,3,4], "reg__subsample":[0.8,1.0]}
+    candidates.append(("GradBoost", gbr, grid_gbr))
+
+    best_name = None; best_model = None; best_metrics = None
+    all_metrics: Dict[str, dict] = {}; leaderboard: Dict[str, dict] = {}
+
+    for name, pipe, grid in candidates:
+        gs = GridSearchCV(pipe, grid, scoring="neg_mean_absolute_error", cv=cv, n_jobs=-1, verbose=0)
+        gs.fit(Xtr, ytr); y_pred = gs.best_estimator_.predict(Xte)
+        m = {"type":"ML","cv_best_params":gs.best_params_, "cv_best_mae":-float(gs.best_score_),
+             "test_r2": float(r2_score(yte, y_pred)),
+             "test_rmse": float(math.sqrt(mean_squared_error(yte, y_pred))),
+             "test_mae": float(mean_absolute_error(yte, y_pred)),
+             "n_train": int(len(df_tr)), "n_test": int(len(df_te))}
+        all_metrics[name] = m; leaderboard[name] = {"test_mae": m["test_mae"], "kind": "ML"}
+        if best_metrics is None or m["test_mae"] < best_metrics["test_mae"]:
+            best_metrics, best_model, best_name = m, gs.best_estimator_, name
+
+    _save_json(all_metrics, "metrics.json"); joblib.dump(best_model, OUT_DIR / "best_model.joblib")
+    print(f"[INFO] Best ML model: {best_name}"); print(json.dumps(best_metrics, indent=2, ensure_ascii=False))
+
+    _parity_residual(ytr.to_numpy(), best_model.predict(Xtr), "train")
+    _parity_residual(yte.to_numpy(), best_model.predict(Xte), "test")
+    Xall = pd.concat([Xtr, Xte], ignore_index=True); yall = pd.concat([ytr, yte], ignore_index=True)
+    _parity_residual(yall.to_numpy(), best_model.predict(Xall), "all")
+    _learning_curve_plot(best_model, Xall, yall)
+    _importance(best_model, Xtr, ytr, feats); _response_surface(best_model); _robustness(best_model)
+
+    # Evaluate both baselines on the same test set
+    def _eval_baseline(colname: str, tag: str) -> Optional[dict]:
+        mask = np.isfinite(df_te[colname].to_numpy()) & np.isfinite(yte.to_numpy())
+        if mask.sum() < 1:
+            print(f"[WARN] No valid samples for baseline {tag}."); return None
+        y_true = yte.to_numpy()[mask]; y_pred = df_te[colname].to_numpy()[mask]
+        mae = float(mean_absolute_error(y_true, y_pred))
+        rmse = float(math.sqrt(mean_squared_error(y_true, y_pred)))
+        r2 = float(r2_score(y_true, y_pred))
+        _parity_residual(y_true, y_pred, f"baseline_{tag}")
+        return {"type":"Baseline","test_mae":mae,"test_rmse":rmse,"test_r2":r2,"n_eval":int(mask.sum())}
+
+    b_ch = _eval_baseline("theta_chord_deg", "chord")
+    b_po = _eval_baseline("theta_poly_deg",  "poly")
+    if b_ch is not None: all_metrics["BaselineChord"]=b_ch; leaderboard["BaselineChord"]={"test_mae": b_ch["test_mae"], "kind":"Baseline"}
+    if b_po is not None: all_metrics["BaselinePoly"]=b_po; leaderboard["BaselinePoly"]={"test_mae": b_po["test_mae"], "kind":"Baseline"}
+    _save_json(all_metrics, "metrics.json"); _save_json(leaderboard, "leaderboard.json")
+
+    # Best overall by Test MAE (info only)
+    best_overall_name, best_overall_mae, best_overall_kind = None, float("inf"), None
+    for k,v in leaderboard.items():
+        if np.isfinite(v["test_mae"]) and v["test_mae"] < best_overall_mae:
+            best_overall_name, best_overall_mae, best_overall_kind = k, v["test_mae"], v["kind"]
+    best_overall = {"name":best_overall_name, "test_mae":best_overall_mae, "kind":best_overall_kind,
+                    "inference_supported": bool(best_overall_kind=="ML"),
+                    "note":"If kind=='Baseline', it cannot do (r,T)->θ_tip; best_model.joblib remains for inference."}
+    _save_json(best_overall, "best_overall.json")
+    print("[INFO] Leaderboard (by Test MAE):"); print(json.dumps(leaderboard, indent=2, ensure_ascii=False))
+    print("[INFO] Best overall by Test MAE:"); print(json.dumps(best_overall, indent=2, ensure_ascii=False))
+    return best_model, all_metrics
+
+# ----------------------- Curvature-shape models -----------------------
+def _signed_kappa_and_s(df: pd.DataFrame):
+    """Return signed κ(s) (1/μm) and s (μm)."""
+    k_point = _find_col_like(df, ["point curvature"])
+    sign_c  = _find_col_like(df, ["point curvature sign", "sign"])
+    if k_point is not None:
+        kappa = pd.to_numeric(df[k_point], errors="coerce").to_numpy()
+        if sign_c is not None:
+            sign = pd.to_numeric(df[sign_c], errors="coerce").to_numpy()
+            nz = np.abs(sign) > 0
+            if nz.any():
+                last=-1
+                for i in range(len(sign)):
+                    if nz[i]: last=i
+                    elif last>=0: sign[i]=np.sign(sign[last])
+                if last<0: sign[:] = 1.0
+            else:
+                sign = np.ones_like(kappa)
+            kappa = kappa * np.sign(sign)
     else:
         k_avg = _find_col_like(df, ["average curvature", "curvature"])
-        if k_avg is None:
-            raise ValueError("No curvature column found for shape model.")
+        if k_avg is None: raise ValueError("No curvature column found for shape model.")
         kappa = pd.to_numeric(df[k_avg], errors="coerce").to_numpy()
 
-    if x_col is not None and y_col is not None:
-        x = pd.to_numeric(df[x_col], errors="coerce").to_numpy()
-        y = pd.to_numeric(df[y_col], errors="coerce").to_numpy()
-        def _interp(v):
-            idx = np.flatnonzero(np.isfinite(v))
-            if len(idx) == 0: return np.zeros_like(v)
-            return np.interp(np.arange(len(v)), idx, v[idx])
-        x = _interp(x); y = _interp(y)
-        ds = np.sqrt(np.diff(x)**2 + np.diff(y)**2)
+    x_um, y_um, _, _ = _get_xy_in_um(df)
+    if x_um is not None and y_um is not None:
+        ds = np.sqrt(np.diff(x_um)**2 + np.diff(y_um)**2)
         s  = np.concatenate([[0.0], np.cumsum(ds)])
     else:
-        s = np.arange(len(kappa), dtype=float)
-
+        s = np.arange(len(kappa), dtype=float) * UM_PER_PX
     mask = np.isfinite(kappa) & np.isfinite(s)
     return kappa[mask], s[mask]
-
 
 def _resample_kappa_from_file(filepath: str, n_points: int = N_POINTS_CURV):
     df = _read_table(Path(filepath))
     kappa, s = _signed_kappa_and_s(df)
-    if len(s) < 3:
-        raise ValueError("Too few points for curvature resampling.")
-    L = float(s[-1] - s[0]) if s[-1] > s[0] else float(len(s) - 1)
+    if len(s) < 3: raise ValueError("Too few points for curvature resampling.")
+    L = float(s[-1] - s[0]) if s[-1] > s[0] else float(len(s)-1) * UM_PER_PX
     s_norm_src = (s - s[0]) / max(L, 1e-9)
     s_norm_tar = np.linspace(0.0, 1.0, n_points)
     kappa_rs = np.interp(s_norm_tar, s_norm_src, kappa)
     return s_norm_tar, kappa_rs, L
 
-
 def train_curvature_shape_models(df_train: pd.DataFrame, df_test: pd.DataFrame):
+    """PCA on curvature shapes and regression from (ratio,temp) to PCA scores and absolute length."""
     feature_cols = ["ratio", "ratio_frac", "temp_C"]
-
     Xtr = df_train[feature_cols].to_numpy(dtype=float)
-    files_tr = df_train["file"].tolist()
-    Ktr, Ltr = [], []
+    files_tr = df_train["file"].tolist(); Ktr, Ltr = [], []
     for fp in files_tr:
         try:
             _, k_rs, L = _resample_kappa_from_file(fp, N_POINTS_CURV)
@@ -513,57 +576,33 @@ def train_curvature_shape_models(df_train: pd.DataFrame, df_test: pd.DataFrame):
         except Exception as e:
             print(f"[WARN] Curvature resampling failed (train): {fp} -> {e}")
     if len(Ktr) < 3:
-        print("[WARN] Too few curves for shape model; skipping.")
-        return
-    Ktr = np.vstack(Ktr)
-    Ltr = np.asarray(Ltr, float)
+        print("[WARN] Too few curves for shape model; skipping."); return
+    Ktr = np.vstack(Ktr); Ltr = np.asarray(Ltr, float)
 
     pca_tmp = PCA(n_components=min(10, Ktr.shape[0], Ktr.shape[1]), svd_solver="full", random_state=RANDOM_SEED)
-    pca_tmp.fit(Ktr)
-    evr_cum = np.cumsum(pca_tmp.explained_variance_ratio_)
-    n_comp = int(np.searchsorted(evr_cum, 0.99) + 1)
-    n_comp = max(1, min(n_comp, 10))
+    pca_tmp.fit(Ktr); evr_cum = np.cumsum(pca_tmp.explained_variance_ratio_)
+    n_comp = int(np.searchsorted(evr_cum, 0.99) + 1); n_comp = max(1, min(n_comp, 10))
     pca = PCA(n_components=n_comp, svd_solver="full", random_state=RANDOM_SEED).fit(Ktr)
     Ztr = pca.transform(Ktr)
 
-    base_reg = GradientBoostingRegressor(random_state=RANDOM_SEED, n_estimators=600,
-                                         max_depth=3, learning_rate=0.06, subsample=0.9)
+    base_reg = GradientBoostingRegressor(random_state=RANDOM_SEED, n_estimators=600, max_depth=3, learning_rate=0.06, subsample=0.9)
     score_reg = MultiOutputRegressor(base_reg).fit(Xtr, Ztr)
-
-    L_reg = GradientBoostingRegressor(random_state=RANDOM_SEED, n_estimators=600,
-                                      max_depth=3, learning_rate=0.06, subsample=0.9)
+    L_reg = GradientBoostingRegressor(random_state=RANDOM_SEED, n_estimators=600, max_depth=3, learning_rate=0.06, subsample=0.9)
     L_reg.fit(Xtr, Ltr)
 
     joblib.dump(pca, OUT_DIR / "curvature_pca.joblib")
     joblib.dump(score_reg, OUT_DIR / "curvature_reg.joblib")
     joblib.dump(L_reg, OUT_DIR / "length_model.joblib")
-    meta = {
-        "n_points": int(N_POINTS_CURV),
-        "n_components": int(n_comp),
-        "explained_variance_ratio_cum": float(evr_cum[n_comp-1]),
-    }
-    with open(OUT_DIR / "curvature_meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False)
+    meta = {"n_points": int(N_POINTS_CURV), "n_components": int(n_comp), "explained_variance_ratio_cum": float(evr_cum[n_comp-1])}
+    _save_json(meta, "curvature_meta.json")
     print(f"[INFO] Saved curvature-shape models to {OUT_DIR} (n_points={N_POINTS_CURV}, n_components={n_comp})")
 
-
-# ------------------- Full θ(s) prediction utilities -------------------
+# ----------------------- θ(s) prediction (for auto-generation only) -----------------------
 def _find_artifact(filename: str) -> Optional[Path]:
-    candidates = [
-        OUT_DIR,
-        ROOT,
-        ROOT / "models",
-        ROOT / "artifacts",
-        ROOT / "trained",
-        ROOT / "outputs",
-        ROOT / "checkpoints",
-    ]
-    for base in candidates:
+    for base in [OUT_DIR, ROOT, ROOT/"models", ROOT/"artifacts", ROOT/"trained", ROOT/"outputs", ROOT/"checkpoints"]:
         p = base / filename
-        if p.exists():
-            return p
+        if p.exists(): return p
     return None
-
 
 def _load_curve_models() -> Dict[str, object]:
     pca_p = _find_artifact("curvature_pca.joblib")
@@ -573,255 +612,397 @@ def _load_curve_models() -> Dict[str, object]:
     if pca_p is None: missing.append("curvature_pca.joblib")
     if reg_p is None: missing.append("curvature_reg.joblib")
     if missing:
-        raise FileNotFoundError(
-            "Missing required curvature-shape artifact(s): "
-            + ", ".join(missing)
-            + f". Looked under OUT_DIR={OUT_DIR} and common folders near this script."
-        )
-    models = {
-        "pca": joblib.load(pca_p),
-        "reg": joblib.load(reg_p),
-        "len": joblib.load(len_p) if len_p is not None else None
-    }
-    return models
-
+        raise FileNotFoundError("Missing required curvature-shape artifact(s): " + ", ".join(missing))
+    return {"pca": joblib.load(pca_p), "reg": joblib.load(reg_p), "len": joblib.load(len_p) if len_p is not None else None}
 
 def _predict_kappa_and_s(models: Dict[str, object], ratio: float, temp_C: float) -> Tuple[np.ndarray, np.ndarray, float]:
-    pca = models["pca"]
-    reg = models["reg"]
-    len_reg = models["len"]
-
-    r = float(ratio)
-    X = np.array([[r, r / (1.0 + r), float(temp_C)]], dtype=float)
-
-    y_pred = reg.predict(X)
-    y_pred = np.asarray(y_pred).reshape(1, -1)
-
+    pca, reg, len_reg = models["pca"], models["reg"], models["len"]
+    r = float(ratio); X = np.array([[r, r/(1.0+r), float(temp_C)]], dtype=float)
+    y_pred = np.asarray(reg.predict(X)).reshape(1, -1)
     n_components = getattr(pca, "n_components_", None) or pca.components_.shape[0]
-    if y_pred.shape[1] == n_components:
-        kappa = pca.inverse_transform(y_pred)[0]
-    else:
-        kappa = y_pred[0]
-
-    N = kappa.shape[0]
-    s_norm = np.linspace(0.0, 1.0, N)
-
+    kappa = pca.inverse_transform(y_pred)[0] if y_pred.shape[1]==n_components else y_pred[0]
+    N = kappa.shape[0]; s_norm = np.linspace(0.0, 1.0, N)
     if len_reg is not None:
         L_abs = float(len_reg.predict(X).ravel()[0])
-        if not np.isfinite(L_abs) or L_abs <= 0:
-            L_abs = 1.0
+        if not np.isfinite(L_abs) or L_abs <= 0: L_abs = 1.0
     else:
         L_abs = 1.0
-
     return kappa, s_norm, L_abs
-
 
 def _kappa_to_theta_deg(kappa: np.ndarray, s_abs: np.ndarray, theta0_deg: float = 0.0) -> np.ndarray:
     theta_rad = _cumtrapz(kappa, s_abs)
     return np.degrees(theta_rad) + float(theta0_deg)
 
-
-def _make_label(ratio: float, temp_C: float) -> str:
-    return f"r={ratio:g}:1, T={temp_C:g}°C"
-
-
-def run_predict_curve(ratio: Optional[float], ratio_str: Optional[str],
-                      temps: List[float], theta0_deg: float,
-                      outdir_override: Optional[str], no_individual_plots: bool) -> None:
-    if ratio is None and ratio_str:
-        m = _ratio_re.search(ratio_str)
-        if not m:
-            raise ValueError("--ratio_str must look like '5vs1' or '5:1'")
-        a, b = float(m.group(1)), float(m.group(2))
-        if b == 0:
-            raise ValueError("ratio denominator cannot be zero.")
-        ratio = a / b
-    if ratio is None:
-        raise ValueError("Provide --ratio or --ratio_str")
-
+def run_predict_curve(ratio: float, temps: List[float], theta0_deg: float = 0.0,
+                      outdir_override: Optional[str] = None, no_individual_plots: bool = False) -> None:
+    """Batch-generate θ(s) for all temps at the given ratio (used post-training for your dataset)."""
     theta_root = Path(outdir_override).resolve() if outdir_override else (OUT_DIR / "theta_curves")
-    (theta_root / "csv").mkdir(parents=True, exist_ok=True)
-    (theta_root / "figs").mkdir(parents=True, exist_ok=True)
-
-    models = _load_curve_models()
-
+    (theta_root/"csv").mkdir(parents=True, exist_ok=True)
+    (theta_root/"figs").mkdir(parents=True, exist_ok=True)
+    try:
+        models = _load_curve_models()
+    except FileNotFoundError as e:
+        print(f"[WARN] {e}"); print("[WARN] Skip θ(s) generation. Train curvature-shape models first."); return
     overlay_curves: List[Tuple[np.ndarray, np.ndarray, str]] = []
     for T in temps:
         kappa, s_norm, L_abs = _predict_kappa_and_s(models, float(ratio), float(T))
         s_abs = s_norm * L_abs
         theta_deg = _kappa_to_theta_deg(kappa, s_abs, theta0_deg=theta0_deg)
-
         tag = f"r{ratio:g}_T{T:g}"
-        df = pd.DataFrame({
-            "s_norm": s_norm,
-            "s_abs": s_abs,
-            "kappa_pred": kappa,
-            "theta_pred_deg": theta_deg,
-        })
-        csv_path = theta_root / "csv" / f"theta_curve_{tag}.csv"
-        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-
+        pd.DataFrame({"s_norm": s_norm, "s_abs": s_abs, "kappa_pred": kappa, "theta_pred_deg": theta_deg})\
+            .to_csv(theta_root/"csv"/f"theta_curve_{tag}.csv", index=False, encoding="utf-8-sig")
         if not no_individual_plots:
-            fig = plt.figure(figsize=(6, 4.2), dpi=150)
+            fig = plt.figure(figsize=(6,4.2), dpi=150)
             plt.plot(s_abs, theta_deg, lw=2)
-            plt.xlabel("Arc length s (absolute units)")
-            plt.ylabel("Tangent angle θ(s) [deg]")
-            plt.title(f"θ(s) — {_make_label(ratio, T)}")
-            plt.grid(True, alpha=0.3)
-            fig.tight_layout()
-            fig_path = theta_root / "figs" / f"theta_curve_{tag}.png"
-            plt.savefig(fig_path)
-            plt.close(fig)
+            plt.xlabel("Arc length s (absolute units)"); plt.ylabel("Tangent angle θ(s) [deg]")
+            plt.title(f"θ(s) — r={ratio:g}:1, T={T:g}°C"); plt.grid(True, alpha=0.3); fig.tight_layout()
+            plt.savefig(theta_root/"figs"/f"theta_curve_{tag}.png"); plt.close(fig)
+        overlay_curves.append((s_abs, theta_deg, f"r={ratio:g}:1, T={T:g}°C"))
+    fig = plt.figure(figsize=(7,4.5), dpi=150)
+    for s_abs, theta_deg, lbl in overlay_curves: plt.plot(s_abs, theta_deg, lw=2, label=lbl)
+    plt.xlabel("Arc length s (absolute units)"); plt.ylabel("Tangent angle θ(s) [deg]")
+    plt.title(f"θ(s) overlay — ratio {ratio:g}:1"); plt.grid(True, alpha=0.3)
+    if len(overlay_curves) > 1: plt.legend()
+    plt.tight_layout(); plt.savefig(theta_root/"figs"/f"theta_overlay_r{ratio:g}.png"); plt.close(fig)
+    print(f"[OK] Saved θ(s) CSVs -> {theta_root/'csv'}"); print(f"[OK] Saved θ(s) figures -> {theta_root/'figs'}")
 
-        overlay_curves.append((s_abs, theta_deg, _make_label(ratio, T)))
-
-    fig = plt.figure(figsize=(7, 4.5), dpi=150)
-    for s_abs, theta_deg, lbl in overlay_curves:
-        plt.plot(s_abs, theta_deg, lw=2, label=lbl)
-    plt.xlabel("Arc length s (absolute units)")
-    plt.ylabel("Tangent angle θ(s) [deg]")
-    plt.title(f"θ(s) overlay — ratio {ratio:g}:1")
-    plt.grid(True, alpha=0.3)
-    if len(overlay_curves) > 1:
-        plt.legend()
-    fig.tight_layout()
-    overlay_path = theta_root / "figs" / f"theta_overlay_r{ratio:g}.png"
-    plt.savefig(overlay_path)
-    plt.close(fig)
-
-    print(f"[OK] Saved θ(s) CSVs -> {theta_root / 'csv'}")
-    print(f"[OK] Saved θ(s) figures -> {theta_root / 'figs'}")
-
-
-# ------------------- Helpers to auto-generate θ(s) after train -------------------
+# ----------------------- Auto-generate θ(s) after training -----------------------
 def auto_generate_theta_curves(df_all: pd.DataFrame, theta0_deg: float = 0.0) -> None:
-    """
-    For each distinct ratio in the dataset, gather all temps and produce θ(s) curves.
-    """
-    # Ensure artifacts exist
+    """Produce θ(s) for all (ratio,temp) combinations seen in the dataset using the trained shape models."""
     pca_ok = _find_artifact("curvature_pca.joblib") is not None
     reg_ok = _find_artifact("curvature_reg.joblib") is not None
     if not (pca_ok and reg_ok):
-        print("[WARN] Curvature-shape artifacts not found; skip θ(s) auto-generation.")
-        return
-
-    by_ratio = (
-        df_all[["ratio", "temp_C"]]
-        .dropna()
-        .sort_values(["ratio", "temp_C"])
-        .groupby("ratio")["temp_C"]
-        .apply(lambda s: sorted(set(float(x) for x in s.tolist())))
-        .to_dict()
-    )
+        print("[WARN] Curvature-shape artifacts not found; skip θ(s) auto-generation."); return
+    by_ratio = (df_all[["ratio","temp_C"]].dropna()
+                .sort_values(["ratio","temp_C"]).groupby("ratio")["temp_C"]
+                .apply(lambda s: sorted(set(float(x) for x in s.tolist()))).to_dict())
     if not by_ratio:
-        print("[WARN] No (ratio, temp) combinations found for θ(s) curves.")
-        return
-
+        print("[WARN] No (ratio,temp) combinations found for θ(s) curves."); return
     print("[INFO] Auto-generating θ(s) curves for dataset combos:")
     for r, temps in by_ratio.items():
         print(f"  - r={r:g}: temps={temps}")
-        run_predict_curve(ratio=float(r), ratio_str=None,
-                          temps=temps, theta0_deg=theta0_deg,
+        run_predict_curve(ratio=float(r), temps=temps, theta0_deg=theta0_deg,
                           outdir_override=None, no_individual_plots=False)
 
+# ----------------------- File-level θ(s) overlays for debugging -----------------------
+def _ensure_dir(p: Path): p.mkdir(parents=True, exist_ok=True)
 
-# ------------------- Entry points -------------------
+def _theta_curve_from_reference_file(file_path: str) -> Tuple[np.ndarray, np.ndarray, str]:
+    """θ_ref(s) from integrating the provided κ(s). Returns (s_abs, θ_deg, label)."""
+    df = _read_table(Path(file_path))
+    kappa, s = _signed_kappa_and_s(df)
+    if len(s) < 3: raise ValueError("Too few points to form reference θ(s).")
+    theta_ref = _cumtrapz(kappa, s); s_abs = s - s[0]
+    return s_abs, np.degrees(theta_ref), "Reference κ(s) integral"
+
+def _theta_curve_from_polyline_xy(file_path: str) -> Optional[Tuple[np.ndarray, np.ndarray, str]]:
+    """θ_polyline(s) from XY by estimating κ(s) on a polyline and integrating."""
+    df = _read_table(Path(file_path))
+    x_um, y_um, _ = _extract_xy_kappa(df)[:3]
+    if x_um is None or y_um is None or len(x_um) < 3: return None
+    x_rs, y_rs, s_rs = _resample_equal_s(x_um, y_um, N=N_POINTS_BASELINE)
+    k_poly, s_poly = _polyline_kappa_from_xy(x_rs, y_rs)
+    theta_poly = _cumtrapz(k_poly, s_poly)
+    return s_poly - s_poly[0], np.degrees(theta_poly), "Polyline-κ baseline"
+
+def _theta_curve_from_chord(file_path: str, N: int = N_POINTS_CURV) -> Optional[Tuple[np.ndarray, np.ndarray, str]]:
+    """θ_chord(s) assuming constant curvature equal to the chord–sagitta θ_tip, linearly distributed over s."""
+    df = _read_table(Path(file_path))
+    x_um, y_um, _ = _extract_xy_kappa(df)[:3]
+    if x_um is None or y_um is None or len(x_um) < 3: return None
+    x_rs, y_rs, s_rs = _resample_equal_s(x_um, y_um, N=N_POINTS_BASELINE)
+    L = float(s_rs[-1] - s_rs[0])
+    theta_tip = _baseline_chord_theta_deg(x_rs, y_rs)
+    s_abs = np.linspace(0.0, L, N); theta_chord = np.linspace(0.0, theta_tip, N)
+    return s_abs, theta_chord, "Chord–Sagitta baseline (const κ)"
+
+def make_baseline_theta_overlay_for_file(file_path: str, include_predicted: bool = False) -> None:
+    """Save per-file overlay for debugging (not meant for the paper)."""
+    comp_dir = FIG_DIR / "baseline_theta"; _ensure_dir(comp_dir)
+    curves: List[Tuple[str, np.ndarray, np.ndarray]] = []
+    s_ref, th_ref, lbl_ref = _theta_curve_from_reference_file(file_path); curves.append((lbl_ref, s_ref, th_ref))
+    poly = _theta_curve_from_polyline_xy(file_path);
+    if poly is not None: s_poly, th_poly, lbl_poly = poly; curves.append((lbl_poly, s_poly, th_poly))
+    chord = _theta_curve_from_chord(file_path)
+    if chord is not None: s_ch, th_ch, lbl_ch = chord; curves.append((lbl_ch, s_ch, th_ch))
+
+    # Optionally add model-predicted θ(s) if you want to inspect it alongside baselines.
+    if include_predicted:
+        try:
+            ratio = parse_ratio_from_path(Path(file_path)); temp = parse_temp_from_path(Path(file_path))
+            if (ratio is not None) and (temp is not None):
+                models = _load_curve_models()
+                k_pred, s_norm, L_abs = _predict_kappa_and_s(models, float(ratio), float(temp))
+                s_abs_pred = s_norm * L_abs; theta_pred = _cumtrapz(k_pred, s_abs_pred)
+                curves.append((f"Predicted θ(s) r={ratio:g},T={temp:g}°C", s_abs_pred, np.degrees(theta_pred)))
+        except Exception as e:
+            print(f"[WARN] Predicted θ(s) not drawn for {file_path}: {e}")
+
+    if len(curves) < 2:
+        print(f"[WARN] Not enough curves to compare for {file_path}"); return
+
+    fig = plt.figure(figsize=(7,4.5), dpi=150)
+    for lbl, sx, th in curves: plt.plot(sx, th, lw=2, label=lbl)
+    plt.xlabel("Arc length s (absolute units)"); plt.ylabel("θ(s) [deg]")
+    sp = Path(file_path); title_stub = f"{sp.parent.name}/{sp.name}"
+    plt.title(f"θ(s) comparison — {title_stub}"); plt.grid(True, alpha=0.3); plt.legend()
+    plt.tight_layout(); plt.savefig(comp_dir / (sp.stem + "_theta_compare.png")); plt.close(fig)
+
+    # Export to CSV for reproducibility
+    try:
+        s_max = max(sx.max() for _, sx, _ in curves if len(sx) > 0)
+        s_common = np.linspace(0.0, float(s_max), N_POINTS_CURV)
+        out = {"s_abs": s_common}
+        for lbl, sx, th in curves:
+            out[lbl] = np.interp(s_common, sx, th)
+        pd.DataFrame(out).to_csv(comp_dir / (sp.stem + "_theta_compare.csv"), index=False, encoding="utf-8-sig")
+    except Exception as e:
+        print(f"[WARN] CSV export failed for {file_path}: {e}")
+
+def generate_baseline_theta_overlays(df_all: pd.DataFrame, max_plots: Optional[int] = None, include_predicted: bool = False) -> None:
+    files = [f for f in df_all["file"].dropna().tolist() if Path(f).exists()]
+    if max_plots is not None: files = files[:max_plots]
+    print(f"[INFO] Generating θ(s) overlays for {len(files)} files...")
+    for fp in files: make_baseline_theta_overlay_for_file(fp, include_predicted=include_predicted)
+
+# ----------------------- Paper-friendly SUMMARIES -----------------------
+def _bootstrap_ci(values: np.ndarray, n_boot: int = N_BOOT, alpha: float = ALPHA, seed: int = RANDOM_SEED) -> Tuple[float,float]:
+    """Return (low, high) percentile bootstrap CI for the mean of 'values'."""
+    rng = np.random.default_rng(seed)
+    values = np.asarray(values, float)
+    if values.size == 0:
+        return float("nan"), float("nan")
+    idx = rng.integers(0, values.size, size=(n_boot, values.size))
+    boots = np.mean(values[idx], axis=1)
+    low = float(np.percentile(boots, 100 * (alpha / 2.0)))
+    high = float(np.percentile(boots, 100 * (1 - alpha / 2.0)))
+    return low, high
+
+def plot_baseline_error_summaries(df_te: pd.DataFrame, best_model, include_ml_bar: bool = True) -> None:
+    """(Kept from previous version) — boxplot + Bland–Altman for test set."""
+    feats = ["ratio","ratio_frac","temp_C"]
+    if df_te.empty:
+        print("[WARN] Empty test set; skip error summaries."); return
+    y_true = df_te["tip_angle_deg"].to_numpy()
+    y_ml   = best_model.predict(df_te[feats])
+    y_ch   = df_te["theta_chord_deg"].to_numpy()
+    y_po   = df_te["theta_poly_deg"].to_numpy()
+
+    def _mask_valid(y): return np.isfinite(y_true) & np.isfinite(y)
+    m_ml, m_ch, m_po = _mask_valid(y_ml), _mask_valid(y_ch), _mask_valid(y_po)
+
+    # Boxplot of |error|
+    fig = plt.figure(figsize=(6,4), dpi=150)
+    labels, data = [], []
+    if include_ml_bar and m_ml.sum()>0: labels.append("ML");       data.append(np.abs(y_ml[m_ml]-y_true[m_ml]))
+    if m_ch.sum()>0:                     labels.append("Chord");    data.append(np.abs(y_ch[m_ch]-y_true[m_ch]))
+    if m_po.sum()>0:                     labels.append("Polyline"); data.append(np.abs(y_po[m_po]-y_true[m_po]))
+    if len(data) >= 2:
+        try:
+            plt.boxplot(data, tick_labels=labels, showfliers=False) # Matplotlib ≥3.9
+        except TypeError:
+            plt.boxplot(data, labels=labels, showfliers=False)       # Older versions
+        plt.ylabel("|Error| (deg)"); plt.title("Absolute error comparison (TEST)")
+        plt.tight_layout(); plt.savefig(FIG_DIR / "error_boxplot_test.png"); plt.close(fig)
+    else:
+        plt.close(fig); print("[WARN] Not enough methods for error boxplot.")
+
+    # Bland–Altman for each baseline
+    def bland(y_pred, name, mask):
+        mean = (y_pred[mask] + y_true[mask]) / 2.0; diff = y_pred[mask] - y_true[mask]
+        md = float(np.mean(diff)); sd = float(np.std(diff, ddof=1)) if diff.size>1 else 0.0
+        fig = plt.figure(figsize=(6,4), dpi=150)
+        plt.scatter(mean, diff, alpha=0.85)
+        plt.axhline(0, ls="--", lw=1, label="zero")
+        plt.axhline(md, ls="-.", lw=1, label=f"mean={md:.2f}")
+        plt.axhline(md+1.96*sd, ls=":", lw=1, label=f"+1.96σ={md+1.96*sd:.2f}")
+        plt.axhline(md-1.96*sd, ls=":", lw=1, label=f"-1.96σ={md-1.96*sd:.2f}")
+        plt.xlabel("Mean of prediction and truth (deg)"); plt.ylabel("Pred - Truth (deg)")
+        plt.title(f"Bland–Altman: {name} vs truth"); plt.legend()
+        plt.tight_layout(); plt.savefig(FIG_DIR / f"bland_altman_{name.lower()}.png"); plt.close(fig)
+    if m_ch.sum()>1: bland(y_ch, "Chord", m_ch)
+    if m_po.sum()>1: bland(y_po, "Polyline", m_po)
+
+def make_paper_baseline_summary(df_te: pd.DataFrame, best_model, df_all: pd.DataFrame, include_ml_bar: bool = True) -> None:
+    """
+    Create three paper-friendly figures + CSV/JSON:
+      (1) baseline_mae_ci.png   — MAE bars with 95% bootstrap CIs (same TEST set).
+      (2) baseline_parity_combined.png — truth vs prediction for both baselines on one axis.
+      (3) baseline_theta_delta_ci.png  — mean ± 95% band of [θ_baseline(s) − θ_ref(s)] over s∈[0,1].
+    """
+    feats = ["ratio","ratio_frac","temp_C"]
+    if df_te.empty:
+        print("[WARN] Empty test set; skip paper summary."); return
+
+    # ----- (1) MAE with 95% bootstrap CI -----
+    y_true = df_te["tip_angle_deg"].to_numpy()
+    y_ch   = df_te["theta_chord_deg"].to_numpy()
+    y_po   = df_te["theta_poly_deg"].to_numpy()
+    def _valid_err(y):
+        m = np.isfinite(y_true) & np.isfinite(y)
+        return np.abs(y[m] - y_true[m])
+    err_ch = _valid_err(y_ch)
+    err_po = _valid_err(y_po)
+    bars = []
+    ci_low = []
+    ci_high = []
+    labels = []
+    if err_ch.size>0:
+        labels.append("Chord")
+        bars.append(float(np.mean(err_ch)))
+        lo, hi = _bootstrap_ci(err_ch); ci_low.append(bars[-1]-lo); ci_high.append(hi-bars[-1])
+    if err_po.size>0:
+        labels.append("Polyline")
+        bars.append(float(np.mean(err_po)))
+        lo, hi = _bootstrap_ci(err_po); ci_low.append(bars[-1]-lo); ci_high.append(hi-bars[-1])
+    if include_ml_bar:
+        y_ml = best_model.predict(df_te[feats])
+        err_ml = _valid_err(y_ml)
+        if err_ml.size>0:
+            labels.append("ML")
+            bars.append(float(np.mean(err_ml)))
+            lo, hi = _bootstrap_ci(err_ml); ci_low.append(bars[-1]-lo); ci_high.append(hi-bars[-1])
+    # Plot
+    if len(bars)>=2:
+        x = np.arange(len(bars))
+        fig = plt.figure(figsize=(5.5,4.2), dpi=150)
+        plt.bar(x, bars, yerr=[ci_low, ci_high], capsize=4)
+        plt.xticks(x, labels); plt.ylabel("MAE (deg)")
+        plt.title("Baseline comparison (MAE ± 95% CI, TEST)")
+        plt.tight_layout(); plt.savefig(PAPER_FIG_DIR / "baseline_mae_ci.png"); plt.close(fig)
+        # Export summary JSON for reproducibility
+        summary = {labels[i]: {"mae": bars[i], "ci_low": bars[i]-ci_low[i], "ci_high": bars[i]+ci_high[i]} for i in range(len(labels))}
+        with open(PAPER_CSV_DIR / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+    else:
+        print("[WARN] Not enough methods to draw MAE CI bar chart.")
+
+    # ----- (2) Combined parity for both baselines -----
+    mask_ch = np.isfinite(y_true) & np.isfinite(y_ch)
+    mask_po = np.isfinite(y_true) & np.isfinite(y_po)
+    if mask_ch.sum()>0 and mask_po.sum()>0:
+        fig = plt.figure(figsize=(5.8,5.3), dpi=150)
+        t_all = np.r_[y_true[mask_ch], y_true[mask_po]]
+        p_all = np.r_[y_ch[mask_ch],   y_po[mask_po]]
+        lims = [min(t_all.min(), p_all.min()), max(t_all.max(), p_all.max())]
+        plt.plot(lims, lims, '--', lw=1, label="y=x")
+        plt.scatter(y_true[mask_ch], y_ch[mask_ch], alpha=0.85, marker='o', label="Chord")
+        plt.scatter(y_true[mask_po], y_po[mask_po], alpha=0.85, marker='s', label="Polyline")
+        plt.xlabel("True θ_tip (deg)"); plt.ylabel("Predicted θ_tip (deg)")
+        plt.title("Parity — two baselines on one axis (TEST)")
+        plt.legend(); plt.tight_layout()
+        plt.savefig(PAPER_FIG_DIR / "baseline_parity_combined.png"); plt.close(fig)
+    else:
+        print("[WARN] Not enough valid points for combined parity.")
+
+    # ----- (3) Aggregated θ(s) deviation band: baseline − reference -----
+    def _theta_curves_snorm(file_path: str) -> Optional[Tuple[np.ndarray,np.ndarray,np.ndarray]]:
+        # Return s_norm, theta_poly_deg, theta_chord_deg (both aligned to θ_ref s-grid).
+        try:
+            s_ref, th_ref, _ = _theta_curve_from_reference_file(file_path)
+        except Exception:
+            return None
+        sn_ref = s_ref / max(float(s_ref[-1]) if len(s_ref)>0 else 1.0, 1e-9)
+        # Polyline baseline
+        poly = _theta_curve_from_polyline_xy(file_path)
+        th_poly = None
+        if poly is not None:
+            s_p, th_p, _ = poly
+            sn_p = s_p / max(float(s_p[-1]) if len(s_p)>0 else 1.0, 1e-9)
+            th_poly = np.interp(sn_ref, sn_p, th_p)
+        # Chord baseline (linear ramp up to its θ_tip)
+        chord = _theta_curve_from_chord(file_path, N=len(sn_ref))
+        th_ch = None
+        if chord is not None:
+            s_c, th_c, _ = chord
+            sn_c = s_c / max(float(s_c[-1]) if len(s_c)>0 else 1.0, 1e-9)
+            th_ch = np.interp(sn_ref, sn_c, th_c)
+        return sn_ref, (th_poly - th_ref if th_poly is not None else None), (th_ch - th_ref if th_ch is not None else None)
+
+    files = [f for f in df_all["file"].dropna().tolist() if Path(f).exists()]
+    if len(files)==0:
+        print("[WARN] No files for θ(s) delta aggregation."); return
+    # Build matrices of delta-theta over common s-grid
+    s_common = np.linspace(0.0, 1.0, N_POINTS_CURV)
+    deltas_poly, deltas_ch = [], []
+    for fp in files:
+        out = _theta_curves_snorm(fp)
+        if out is None: continue
+        sn, d_poly, d_ch = out
+        if d_poly is not None:
+            deltas_poly.append(np.interp(s_common, sn, d_poly))
+        if d_ch is not None:
+            deltas_ch.append(np.interp(s_common, sn, d_ch))
+    deltas_poly = np.array(deltas_poly) if len(deltas_poly)>0 else None
+    deltas_ch   = np.array(deltas_ch)   if len(deltas_ch)>0 else None
+
+    if deltas_poly is None and deltas_ch is None:
+        print("[WARN] No valid θ(s) deltas for aggregation."); return
+
+    fig = plt.figure(figsize=(7.2,4.6), dpi=150)
+    if deltas_poly is not None and deltas_poly.shape[0] >= 1:
+        m = np.nanmean(deltas_poly, axis=0)
+        lo = np.nanpercentile(deltas_poly, 2.5, axis=0)
+        hi = np.nanpercentile(deltas_poly, 97.5, axis=0)
+        plt.plot(s_common, m, lw=2, label="Polyline − Ref")
+        plt.fill_between(s_common, lo, hi, alpha=0.25)
+        # export
+        pd.DataFrame({"s_norm": s_common, "mean": m, "p2.5": lo, "p97.5": hi}).to_csv(PAPER_CSV_DIR/"theta_delta_polyline.csv", index=False, encoding="utf-8-sig")
+    if deltas_ch is not None and deltas_ch.shape[0] >= 1:
+        m = np.nanmean(deltas_ch, axis=0)
+        lo = np.nanpercentile(deltas_ch, 2.5, axis=0)
+        hi = np.nanpercentile(deltas_ch, 97.5, axis=0)
+        plt.plot(s_common, m, lw=2, label="Chord − Ref")
+        plt.fill_between(s_common, lo, hi, alpha=0.25)
+        # export
+        pd.DataFrame({"s_norm": s_common, "mean": m, "p2.5": lo, "p97.5": hi}).to_csv(PAPER_CSV_DIR/"theta_delta_chord.csv", index=False, encoding="utf-8-sig")
+    plt.axhline(0, lw=1, ls="--")
+    plt.xlabel("Normalized arc length s (0→1)")
+    plt.ylabel("Δθ(s) [deg] (baseline − reference)")
+    plt.title("Baseline bias along s (mean ± 95% band)")
+    plt.tight_layout(); plt.savefig(PAPER_FIG_DIR / "baseline_theta_delta_ci.png"); plt.close(fig)
+
+# ----------------------- Training entry -----------------------
 def run_train():
     df_tr = collect_dataset(TRAIN_DIR, "train")
     df_te = collect_dataset(TEST_DIR,  "test")
-
-    if df_tr.empty and df_te.empty:
-        raise RuntimeError("No usable CSV/XLSX found in train/ or test/.")
-
+    if df_tr.empty and df_te.empty: raise RuntimeError("No usable CSV/XLSX found in train/ or test/.")
     if df_te.empty:
         df = df_tr.sample(frac=1.0, random_state=RANDOM_SEED).reset_index(drop=True)
-        n = max(1, int(0.8 * len(df)))
-        df_tr, df_te = df.iloc[:n].copy(), df.iloc[n:].copy()
+        n = max(1, int(0.8 * len(df))); df_tr, df_te = df.iloc[:n].copy(), df.iloc[n:].copy()
         print("[WARN] No test/ directory found. Used 80/20 split from training set.")
-
     df_tr.to_csv(OUT_DIR / "dataset_train_clean.csv", index=False, encoding="utf-8-sig")
     df_te.to_csv(OUT_DIR / "dataset_test_clean.csv",  index=False, encoding="utf-8-sig")
     df_all = pd.concat([df_tr, df_te], ignore_index=True)
     df_all.to_csv(OUT_DIR / "dataset_all_clean.csv", index=False, encoding="utf-8-sig")
-
     print(f"[INFO] Train samples: {len(df_tr)}, Test samples: {len(df_te)}")
-    train_and_eval(df_tr, df_te)
 
-    # Train curvature-shape models & auto-generate θ(s)
+    best_model, _ = train_and_eval(df_tr, df_te)
     train_curvature_shape_models(df_tr, df_te)
     auto_generate_theta_curves(df_all, theta0_deg=0.0)
 
-    print(f"[OK] Figures -> {FIG_DIR}")
+    # Keep the previous diagnostic visuals:
+    plot_baseline_error_summaries(df_te, best_model, include_ml_bar=True)
+    generate_baseline_theta_overlays(df_all, include_predicted=False)
+
+    # NEW: compact, paper-ready summaries (figures + CSV)
+    make_paper_baseline_summary(df_te, best_model, df_all, include_ml_bar=True)
+
+    print(f"[OK] Figures -> {FIG_DIR} and {PAPER_FIG_DIR}")
     print(f"[OK] Model & metrics -> {OUT_DIR}")
 
-
-def run_predict(ratio: Optional[float], ratio_str: Optional[str], temp: float):
-    if ratio is None and ratio_str:
-        m = _ratio_re.search(ratio_str)
-        if not m:
-            raise ValueError("--ratio_str must look like '5vs1'")
-        a, b = int(m.group(1)), int(m.group(2))
-        ratio = a / b
-    if ratio is None:
-        raise ValueError("Provide --ratio or --ratio_str")
-
-    model = joblib.load(OUT_DIR / "best_model.joblib")
-    df = pd.DataFrame({
-        "ratio": [ratio],
-        "ratio_frac": [ratio / (1 + ratio)],
-        "temp_C": [temp]
-    })
-    pred = float(model.predict(df)[0])
-    print(json.dumps({
-        "inputs": {"ratio": ratio, "temp_C": temp},
-        "prediction": {"theta_tip_deg": pred}
-    }, indent=2, ensure_ascii=False))
-
-
+# ----------------------- CLI -----------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="PNIPAM:PDMS bending angle model — training, prediction, and full-curve inference"
-    )
-    parser.add_argument("--data_root", type=str, default=None,
-                        help="Folder that contains train/ and test/ (default: this file's directory)")
-    parser.add_argument("--out_dir", type=str, default=None,
-                        help="Output folder (default: ./outputs relative to this file)")
-    sub = parser.add_subparsers(dest="cmd")
-
-    # Single-point θ_tip prediction
-    p_pred = sub.add_parser("predict", help="Single-point θ_tip prediction (after training)")
-    p_pred.add_argument("--ratio", type=float, default=None,
-                        help="r = PNIPAM:PDMS front term (e.g., 5 for 5:1)")
-    p_pred.add_argument("--ratio_str", type=str, default=None,
-                        help="String like '5vs1' or '5:1'")
-    p_pred.add_argument("--temp", type=float, required=False,
-                        help="Temperature in °C")
-
-    # Full curve θ(s) prediction
-    p_curve = sub.add_parser("predict_curve", help="Predict full θ(s) curve(s) from saved curvature-shape models")
-    p_curve.add_argument("--ratio", type=float, default=None,
-                         help="r = PNIPAM:PDMS front term (e.g., 5 for 5:1)")
-    p_curve.add_argument("--ratio_str", type=str, default=None,
-                         help="String like '5vs1' or '5:1'")
-    p_curve.add_argument("--temp", type=float, nargs="+", required=True,
-                         help="One or more temperatures in °C, e.g., --temp 20 30 40")
-    p_curve.add_argument("--theta0_deg", type=float, default=0.0,
-                         help="θ(0) offset in degrees (default 0)")
-    p_curve.add_argument("--outdir", type=str, default=None,
-                         help="Override output folder for θ(s) curves (default: OUT_DIR/theta_curves)")
-    p_curve.add_argument("--no_individual_plots", action="store_true",
-                         help="Only write overlay figure, skip per-(r,T) figures")
-
+    parser = argparse.ArgumentParser(description="Training-only pipeline with paper-friendly baseline summaries")
+    parser.add_argument("--data_root", type=str, default=None, help="Folder containing train/ and test/ subfolders")
+    parser.add_argument("--out_dir",   type=str, default=None,    help="Output folder (default: ./outputs)")
+    parser.add_argument("--um_per_px", type=float, default=None,  help="Global pixel size in μm/px (fallback if not found in files)")
     args = parser.parse_args()
-    configure_paths(args.data_root, args.out_dir)
 
-    if args.cmd == "predict":
-        if args.temp is None:
-            raise ValueError("--temp is required for prediction")
-        run_predict(args.ratio, args.ratio_str, args.temp)
-    elif args.cmd == "predict_curve":
-        run_predict_curve(args.ratio, args.ratio_str, args.temp, args.theta0_deg,
-                          args.outdir, args.no_individual_plots)
-    else:
-        # default: train (and auto-generate θ(s) curves)
-        run_train()
+    if args.um_per_px is not None:
+        UM_PER_PX = float(args.um_per_px)
+        if UM_PER_PX <= 0: UM_PER_PX = 1.0
+        print(f"[INFO] Global UM_PER_PX = {UM_PER_PX} μm/px (fallback)")
+
+    configure_paths(args.data_root, args.out_dir)
+    run_train()
