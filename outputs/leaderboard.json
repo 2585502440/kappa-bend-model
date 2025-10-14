@@ -1,0 +1,22 @@
+{
+  "PolyLinear": {
+    "test_mae": 45.20724930205063,
+    "kind": "ML"
+  },
+  "RandomForest": {
+    "test_mae": 55.68186002085523,
+    "kind": "ML"
+  },
+  "GradBoost": {
+    "test_mae": 62.11768124031564,
+    "kind": "ML"
+  },
+  "BaselineChord": {
+    "test_mae": 270.85577255259096,
+    "kind": "Baseline"
+  },
+  "BaselinePoly": {
+    "test_mae": 280.03366620931934,
+    "kind": "Baseline"
+  }
+}
