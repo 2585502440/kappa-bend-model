@@ -1,0 +1,12 @@
+{
+  "MAE": {
+    "ML_vs_Chord": 0.061246937653117346,
+    "ML_vs_Polyline": 0.061246937653117346,
+    "Polyline_vs_Chord": 1.0
+  },
+  "RMSE": {
+    "ML_vs_Chord": 0.061246937653117346,
+    "ML_vs_Polyline": 0.061246937653117346,
+    "Polyline_vs_Chord": 1.0
+  }
+}
