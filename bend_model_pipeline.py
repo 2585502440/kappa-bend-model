@@ -9,12 +9,19 @@ What this script does
 - Compute two geometry baselines under unified preprocessing:
     (1) Chord–Sagitta (constant κ), (2) Polyline-κ (curvature from resampled XY).
 - Save the usual figures (parity/residual/learning curve/robustness/response surface).
-- NEW: Paper-friendly summaries under outputs/paper/:
+- Paper-friendly summaries under outputs/paper/:
     1) baseline_mae_ci.png — MAE with 95% bootstrap CIs (same test set for both baselines; optional ML).
     2) baseline_parity_combined.png — both baselines on one parity axis (truth vs prediction).
     3) baseline_theta_delta_ci.png — mean ± 95% band of [θ_baseline(s) − θ_ref(s)] over s∈[0,1],
        aggregated across all available files (unit-consistent).
-    All underlying arrays are exported to CSV/JSON for reproducibility.
+
+NEW in this version
+-------------------
+- Cumulative Simpson integration and Trapezoid-vs-Simpson consistency check for discretization uncertainty.
+- 2D rigid registration (Kabsch/Procrustes) on (s_norm, θ(s)) curves; export RMS & Hausdorff distances.
+- Paired permutation test (two-sided) comparing methods' MAE/RMSE; plus bootstrap 95% CIs for MAE/RMSE/R².
+- GUM-style uncertainty (MC propagation): Class A (digitization/quantization), Class B (calibration k),
+  and discretization term (trap vs simpson). Per-file CSV and overall JSON summaries.
 
 Inputs & calibration
 --------------------
@@ -25,7 +32,7 @@ Inputs & calibration
 
 Usage
 -----
-python try.py --data_root <folder with train/ and test/> --out_dir <outputs/> --um_per_px 0.62
+python bend_model_pipeline.py --data_root <folder with train/ and test/> --out_dir <outputs/> --um_per_px 0.62
 """
 
 from __future__ import annotations
@@ -70,6 +77,11 @@ UM_PER_PX = 1.0
 N_BOOT = 10000
 ALPHA = 0.05
 
+# NEW: Uncertainty & statistics tunables
+N_MC_UNCERT = 2000           # Monte Carlo samples for GUM-style uncertainty
+REL_K_STD = 0.02             # relative standard uncertainty for calibration factor k (Type B), e.g., 2%
+N_PERM = 20000               # permutations (sign-flips) for paired permutation tests
+
 # ----------------------- Paths -----------------------
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT
@@ -85,13 +97,17 @@ PAPER_CSV_DIR = OUT_DIR / "paper" / "csv"
 PAPER_FIG_DIR.mkdir(parents=True, exist_ok=True)
 PAPER_CSV_DIR.mkdir(parents=True, exist_ok=True)
 
+# NEW: statistics outputs
+STATS_DIR = OUT_DIR / "stats"
+STATS_DIR.mkdir(parents=True, exist_ok=True)
+
 _ratio_re = re.compile(r"(\d+)\s*vs\s*(\d+)", re.IGNORECASE)
 _temp_re  = re.compile(r"(\d+)\s*C", re.IGNORECASE)
 
 # ----------------------- Small IO utils -----------------------
 def configure_paths(data_root: Optional[str], out_dir: Optional[str]) -> None:
     """Set data/output directories at runtime."""
-    global DATA_ROOT, TRAIN_DIR, TEST_DIR, OUT_DIR, FIG_DIR, PAPER_FIG_DIR, PAPER_CSV_DIR
+    global DATA_ROOT, TRAIN_DIR, TEST_DIR, OUT_DIR, FIG_DIR, PAPER_FIG_DIR, PAPER_CSV_DIR, STATS_DIR
     if data_root:
         DATA_ROOT = Path(data_root).resolve()
         TRAIN_DIR = DATA_ROOT / "train"; TEST_DIR = DATA_ROOT / "test"
@@ -105,6 +121,8 @@ def configure_paths(data_root: Optional[str], out_dir: Optional[str]) -> None:
     PAPER_CSV_DIR = OUT_DIR / "paper" / "csv"
     PAPER_FIG_DIR.mkdir(parents=True, exist_ok=True)
     PAPER_CSV_DIR.mkdir(parents=True, exist_ok=True)
+    STATS_DIR = OUT_DIR / "stats"
+    STATS_DIR.mkdir(parents=True, exist_ok=True)
 
 def _read_table(path: Path) -> pd.DataFrame:
     """Read CSV/XLSX with a few fallback encodings."""
@@ -132,6 +150,37 @@ def _cumtrapz(y: np.ndarray, x: np.ndarray) -> np.ndarray:
     if len(y) < 2: return np.zeros_like(y)
     dx = np.diff(x); mid = 0.5 * (y[1:] + y[:-1]) * dx
     out = np.zeros_like(y, float); out[1:] = np.cumsum(mid)
+    return out
+
+# NEW: cumulative Simpson integration (non-uniform x) via local quadratic fits
+def _cumsimpson(y: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """
+    Cumulative 'Simpson-like' integral for possibly non-uniform x by integrating a local quadratic
+    through triples (x[i-2],x[i-1],x[i]) over [x[i-2], x[i]]. The last leftover interval (odd length)
+    is integrated with trapezoid. Falls back to trapezoid if <3 points.
+    """
+    y = np.asarray(y, float); x = np.asarray(x, float)
+    n = len(y)
+    if n < 3:
+        return _cumtrapz(y, x)
+    out = np.zeros(n, float)
+    # first step: use trapezoid for i=1
+    out[1] = out[0] + 0.5 * (y[0] + y[1]) * (x[1] - x[0])
+    # then accumulate by quadratic segments for i>=2
+    for i in range(2, n):
+        # quadratic through (x[i-2], y[i-2]), (x[i-1], y[i-1]), (x[i], y[i])
+        xs = x[i-2:i+1]; ys = y[i-2:i+1]
+        # fit quadratic a t^2 + b t + c
+        try:
+            a, b, c = np.polyfit(xs, ys, 2)
+            # integral from x[i-1] to x[i]
+            F = lambda t: (a/3.0)*t**3 + 0.5*b*t**2 + c*t
+            # add the last slice incrementally
+            inc = F(xs[2]) - F(xs[1])
+            out[i] = out[i-1] + inc
+        except Exception:
+            # fallback: trapezoid for the last small step
+            out[i] = out[i-1] + 0.5 * (ys[1] + ys[2]) * (xs[2] - xs[1])
     return out
 
 def _trapz_safe(y: np.ndarray, x: np.ndarray) -> float:
@@ -231,7 +280,7 @@ def parse_temp_from_path(path: Path) -> Optional[float]:
 
 # ----------------------- Tip angle & baselines (unit-consistent) -----------------------
 def integrate_tip_angle(df: pd.DataFrame) -> Dict[str, float]:
-    """Integrate κ(s) to get θ_tip (deg); s is always in μm."""
+    """Integrate κ(s) to get θ_tip (deg); s is always in μm. Also returns Simpson/trapezoid consistency."""
     k_point = _find_col_like(df, ["point curvature"])
     sign_c  = _find_col_like(df, ["point curvature sign", "sign"])
 
@@ -267,13 +316,19 @@ def integrate_tip_angle(df: pd.DataFrame) -> Dict[str, float]:
     kappa = kappa[mask]; s = s[mask]
     if len(s) < 3: raise ValueError("Too few valid points to integrate.")
 
-    theta_rad = _cumtrapz(kappa, s)
-    tip_angle_deg = float(np.degrees(theta_rad[-1]))
+    theta_trap = _cumtrapz(kappa, s)
+    theta_simp = _cumsimpson(kappa, s)  # NEW: Simpson cumulative
+    tip_angle_deg_trap = float(np.degrees(theta_trap[-1]))
+    tip_angle_deg_simp = float(np.degrees(theta_simp[-1]))
+    disc_delta_deg = float(abs(tip_angle_deg_simp - tip_angle_deg_trap))
+
     L = float(s[-1] - s[0])
     mean_kappa = _trapz_safe(kappa, s) / max(L, 1e-9)
     max_abs_kappa = float(np.nanmax(np.abs(kappa)))
-    return dict(tip_angle_deg=tip_angle_deg, L=L,
-                mean_kappa=float(mean_kappa), max_abs_kappa=max_abs_kappa)
+    return dict(tip_angle_deg=tip_angle_deg_trap,
+                tip_angle_deg_simp=tip_angle_deg_simp,   # NEW
+                disc_delta_deg=disc_delta_deg,           # NEW (for discretization uncertainty)
+                L=L, mean_kappa=float(mean_kappa), max_abs_kappa=max_abs_kappa)
 
 def _polyline_kappa_from_xy(x_um: np.ndarray, y_um: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Compute curvature along polyline sampled at equal arc-length spacing (units 1/μm)."""
@@ -351,7 +406,7 @@ def collect_dataset(split_dir: Path, split_name: str) -> pd.DataFrame:
         n_total += 1
         try:
             df = _read_table(path)
-            feats = integrate_tip_angle(df)
+            feats = integrate_tip_angle(df)  # includes trap/simpson & disc_delta
             ratio = parse_ratio_from_path(path); temp = parse_temp_from_path(path)
             if ratio is None or temp is None:
                 print(f"[WARN] Skip (cannot parse ratio/temp): {path}"); continue
@@ -962,6 +1017,300 @@ def make_paper_baseline_summary(df_te: pd.DataFrame, best_model, df_all: pd.Data
     plt.title("Baseline bias along s (mean ± 95% band)")
     plt.tight_layout(); plt.savefig(PAPER_FIG_DIR / "baseline_theta_delta_ci.png"); plt.close(fig)
 
+# ----------------------- NEW: Paired permutation tests & bootstrap metrics -----------------------
+def _paired_permutation_pvalue(a_vals: np.ndarray, b_vals: np.ndarray, n_perm: int = N_PERM, seed: int = RANDOM_SEED) -> float:
+    """
+    Two-sided paired permutation (sign-flip) test on paired samples.
+    Returns p-value for mean(a - b) under H0: mean diff == 0.
+    """
+    a_vals = np.asarray(a_vals, float); b_vals = np.asarray(b_vals, float)
+    mask = np.isfinite(a_vals) & np.isfinite(b_vals)
+    d = a_vals[mask] - b_vals[mask]
+    if d.size < 2: return float("nan")
+    obs = abs(np.mean(d))
+    rng = np.random.default_rng(seed)
+    # sign flips
+    signs = rng.choice([-1.0, 1.0], size=(n_perm, d.size))
+    null_means = np.mean(signs * d, axis=1)
+    p = float((np.sum(np.abs(null_means) >= obs) + 1) / (n_perm + 1))
+    return p
+
+def _bootstrap_metric_cis(y_true: np.ndarray, y_pred: np.ndarray, n_boot: int = N_BOOT, alpha: float = ALPHA, seed: int = RANDOM_SEED) -> Dict[str, Dict[str, float]]:
+    """Bootstrap CIs for MAE / RMSE / R2."""
+    y_true = np.asarray(y_true, float); y_pred = np.asarray(y_pred, float)
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    yt, yp = y_true[mask], y_pred[mask]
+    if yt.size < 2:
+        return {"MAE":{"mean":float("nan"),"lo":float("nan"),"hi":float("nan")},
+                "RMSE":{"mean":float("nan"),"lo":float("nan"),"hi":float("nan")},
+                "R2":{"mean":float("nan"),"lo":float("nan"),"hi":float("nan")}}
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, yt.size, size=(n_boot, yt.size))
+    mae = np.mean(np.abs(yp - yt))
+    rmse = math.sqrt(np.mean((yp - yt)**2))
+    r2 = r2_score(yt, yp)
+    maes = np.mean(np.abs(yp[idx] - yt[idx]), axis=1)
+    rmses = np.sqrt(np.mean((yp[idx] - yt[idx])**2, axis=1))
+    # R² bootstrap by resampling pairs
+    r2s = np.array([r2_score(yt[i], yp[i]) for i in idx])
+    def CI(arr):
+        lo = float(np.percentile(arr, 100 * (alpha/2)))
+        hi = float(np.percentile(arr, 100 * (1 - alpha/2)))
+        return lo, hi
+    lo_mae, hi_mae = CI(maes); lo_rmse, hi_rmse = CI(rmses); lo_r2, hi_r2 = CI(r2s)
+    return {"MAE":{"mean":float(mae),"lo":lo_mae,"hi":hi_mae},
+            "RMSE":{"mean":float(rmse),"lo":lo_rmse,"hi":hi_rmse},
+            "R2":{"mean":float(r2),"lo":lo_r2,"hi":hi_r2}}
+
+def compute_tests_and_bootstrap(df_te: pd.DataFrame, best_model) -> None:
+    """Compute paired permutation p-values and bootstrap CIs; save under outputs/stats/"""
+    if df_te.empty:
+        print("[WARN] Empty test set; skip stats tests."); return
+    feats = ["ratio","ratio_frac","temp_C"]
+    y_true = df_te["tip_angle_deg"].to_numpy()
+    y_ml   = best_model.predict(df_te[feats])
+    y_ch   = df_te["theta_chord_deg"].to_numpy()
+    y_po   = df_te["theta_poly_deg"].to_numpy()
+
+    # Bootstrap CIs for all three
+    out_ci = {
+        "ML": _bootstrap_metric_cis(y_true, y_ml),
+        "Chord": _bootstrap_metric_cis(y_true, y_ch),
+        "Polyline": _bootstrap_metric_cis(y_true, y_po)
+    }
+    with open(STATS_DIR / "bootstrap_metrics_ci.json", "w", encoding="utf-8") as f:
+        json.dump(out_ci, f, indent=2, ensure_ascii=False)
+
+    # Paired permutation on per-sample |error| (MAE) and squared error (RMSE surrogate)
+    def errs(y_pred):
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        return np.abs(y_pred[mask]-y_true[mask]), (y_pred[mask]-y_true[mask])**2
+
+    abs_ml, sq_ml = errs(y_ml)
+    abs_ch, sq_ch = errs(y_ch)
+    abs_po, sq_po = errs(y_po)
+
+    pvals = {
+        "MAE": {
+            "ML_vs_Chord": _paired_permutation_pvalue(abs_ml, abs_ch),
+            "ML_vs_Polyline": _paired_permutation_pvalue(abs_ml, abs_po),
+            "Polyline_vs_Chord": _paired_permutation_pvalue(abs_po, abs_ch)
+        },
+        "RMSE": {
+            "ML_vs_Chord": _paired_permutation_pvalue(sq_ml, sq_ch),
+            "ML_vs_Polyline": _paired_permutation_pvalue(sq_ml, sq_po),
+            "Polyline_vs_Chord": _paired_permutation_pvalue(sq_po, sq_ch)
+        }
+    }
+    with open(STATS_DIR / "permutation_pvalues.json", "w", encoding="utf-8") as f:
+        json.dump(pvals, f, indent=2, ensure_ascii=False)
+    print("[OK] Stats tests ->", STATS_DIR)
+
+# ----------------------- NEW: GUM-style uncertainty (MC propagation) -----------------------
+def _mc_quantization_theta(kappa: np.ndarray, s: np.ndarray, df: pd.DataFrame, n_mc: int = N_MC_UNCERT) -> float:
+    """
+    Type A: digitization/quantization.
+    If XY available, add U(-0.5*scale, +0.5*scale) to every XY point, recompute s and integrate κ(s) by trapezoid.
+    Else, jitter ds with U(-0.5*UM_PER_PX, +0.5*UM_PER_PX).
+    Returns std of θ_tip (deg) over MC samples.
+    """
+    x_um, y_um, scale, _ = _get_xy_in_um(df)
+    rng = np.random.default_rng(RANDOM_SEED)
+    thetas = []
+    if x_um is not None and y_um is not None and len(x_um) >= 3:
+        for _ in range(n_mc):
+            nx = x_um + rng.uniform(-0.5*scale, 0.5*scale, size=len(x_um))
+            ny = y_um + rng.uniform(-0.5*scale, 0.5*scale, size=len(y_um))
+            ds = np.hypot(np.diff(nx), np.diff(ny))
+            s_mc = np.concatenate([[0.0], np.cumsum(ds)])
+            th = _cumtrapz(kappa, s_mc)
+            thetas.append(float(np.degrees(th[-1])))
+    else:
+        # jitter s spacing directly
+        ds = np.diff(s)
+        for _ in range(n_mc):
+            noise = rng.uniform(-0.5*UM_PER_PX, 0.5*UM_PER_PX, size=ds.size)
+            ds_mc = np.maximum(1e-9, ds + noise)
+            s_mc = np.concatenate([[0.0], np.cumsum(ds_mc)])
+            th = _cumtrapz(kappa, s_mc)
+            thetas.append(float(np.degrees(th[-1])))
+    return float(np.std(thetas, ddof=1)) if len(thetas) > 1 else 0.0
+
+def _mc_calibration_theta(kappa: np.ndarray, s: np.ndarray, rel_std: float = REL_K_STD, n_mc: int = N_MC_UNCERT) -> float:
+    """
+    Type B: calibration factor k uncertainty. Sample k ~ N(1, rel_std), scale s' = k*s and integrate.
+    Returns std of θ_tip (deg).
+    """
+    rng = np.random.default_rng(RANDOM_SEED+1)
+    thetas = []
+    for _ in range(n_mc):
+        k = rng.normal(1.0, rel_std)
+        s_mc = s * max(k, 1e-9)
+        th = _cumtrapz(kappa, s_mc)
+        thetas.append(float(np.degrees(th[-1])))
+    return float(np.std(thetas, ddof=1)) if len(thetas) > 1 else 0.0
+
+def _uncertainty_for_one_file(path: str) -> Optional[Dict[str, float]]:
+    """
+    Compute per-file uncertainties:
+      u_A (quantization), u_B (calibration), u_disc (trap-vs-simpson), combined u_c, expanded U_k2.
+    """
+    try:
+        df = _read_table(Path(path))
+        kappa, s = _signed_kappa_and_s(df)
+        if len(s) < 3: return None
+        # nominal
+        th_trap = _cumtrapz(kappa, s); th_simp = _cumsimpson(kappa, s)
+        tip_deg = float(np.degrees(th_trap[-1]))
+        u_disc = abs(float(np.degrees(th_simp[-1]) - tip_deg))  # take absolute diff (deg)
+        u_A = _mc_quantization_theta(kappa, s, df, n_mc=N_MC_UNCERT)
+        u_B = _mc_calibration_theta(kappa, s, rel_std=REL_K_STD, n_mc=N_MC_UNCERT)
+        u_c = float(math.sqrt(u_A*u_A + u_B*u_B + u_disc*u_disc))
+        U_k2 = 2.0 * u_c
+        return {"file": path, "theta_tip_deg": tip_deg, "u_A_deg": u_A, "u_B_deg": u_B,
+                "u_disc_deg": u_disc, "u_c_deg": u_c, "U_k2_deg": U_k2,
+                "n_points": int(len(s))}
+    except Exception as e:
+        print(f"[WARN] Uncertainty failed for {path}: {e}")
+        return None
+
+def compute_gum_uncertainties(df_all: pd.DataFrame) -> None:
+    """Compute GUM-like uncertainties for all files; write CSV and overall JSON."""
+    files = [f for f in df_all["file"].dropna().tolist() if Path(f).exists()]
+    rows = []
+    for fp in files:
+        r = _uncertainty_for_one_file(fp)
+        if r is not None: rows.append(r)
+    if not rows:
+        print("[WARN] No uncertainty rows computed."); return
+    dfu = pd.DataFrame(rows)
+    dfu.to_csv(STATS_DIR / "uncertainty_per_file.csv", index=False, encoding="utf-8-sig")
+    overall = {
+        "count": int(len(dfu)),
+        "theta_tip_deg_mean": float(dfu["theta_tip_deg"].mean()),
+        "u_A_deg_mean": float(dfu["u_A_deg"].mean()),
+        "u_B_deg_mean": float(dfu["u_B_deg"].mean()),
+        "u_disc_deg_mean": float(dfu["u_disc_deg"].mean()),
+        "u_c_deg_mean": float(dfu["u_c_deg"].mean()),
+        "U_k2_deg_mean": float(dfu["U_k2_deg"].mean())
+    }
+    with open(STATS_DIR / "uncertainty_overall.json", "w", encoding="utf-8") as f:
+        json.dump(overall, f, indent=2, ensure_ascii=False)
+    print("[OK] Uncertainty ->", STATS_DIR)
+
+# ----------------------- NEW: Kabsch/Procrustes (rigid) on (s_norm, θ) curves -----------------------
+def _kabsch(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Solve R,t that minimize ||P - (R Q + t)||_F for 2D point sets (no reflection).
+    Returns (R, t). R is 2x2 rotation, t is 2x1 translation vector.
+    """
+    P = np.asarray(P, float); Q = np.asarray(Q, float)
+    if P.shape != Q.shape or P.shape[1] != 2:
+        raise ValueError("P and Q must be (N,2) with equal N.")
+    Pc = P - P.mean(axis=0, keepdims=True)
+    Qc = Q - Q.mean(axis=0, keepdims=True)
+    H = Qc.T @ Pc
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:  # avoid reflection
+        Vt[1,:] *= -1
+        R = Vt.T @ U.T
+    t = P.mean(axis=0) - (R @ Q.mean(axis=0))
+    return R, t
+
+def _hausdorff(P: np.ndarray, Q: np.ndarray) -> float:
+    """Symmetric Hausdorff distance between two 2D point sets."""
+    def directed(A, B):
+        # for each a in A, min distance to B
+        d = []
+        for a in A:
+            d.append(np.min(np.linalg.norm(B - a, axis=1)))
+        return np.max(d) if d else 0.0
+    return float(max(directed(P,Q), directed(Q,P)))
+
+def _kabsch_metrics_for_file(file_path: str) -> List[Dict[str, float]]:
+    """
+    Build (s_norm, θ) for reference and for each baseline, run rigid registration, report RMS & Hausdorff.
+    """
+    try:
+        s_ref, th_ref, _ = _theta_curve_from_reference_file(file_path)
+    except Exception:
+        return []
+    if len(s_ref) < 3: return []
+    s_norm = s_ref / max(float(s_ref[-1]), 1e-9)
+    ref = np.stack([s_norm, th_ref], axis=1)
+
+    results = []
+    # polyline baseline
+    poly = _theta_curve_from_polyline_xy(file_path)
+    if poly is not None:
+        s_p, th_p, _ = poly
+        sp = (s_p / max(float(s_p[-1]), 1e-9))
+        poly2 = np.stack([np.interp(s_norm, sp, sp), np.interp(s_norm, sp, th_p)], axis=1)
+        R, t = _kabsch(ref, poly2)
+        Qhat = (R @ poly2.T).T + t
+        rms = float(np.sqrt(np.mean(np.sum((ref - Qhat)**2, axis=1))))
+        hd = _hausdorff(ref, Qhat)
+        rot_deg = float(np.degrees(np.arctan2(R[1,0], R[0,0])))
+        results.append({"file":file_path, "method":"Polyline", "rms":rms, "hausdorff":hd, "rot_deg":rot_deg, "tx":float(t[0]), "ty":float(t[1])})
+    # chord baseline
+    chord = _theta_curve_from_chord(file_path, N=len(s_ref))
+    if chord is not None:
+        s_c, th_c, _ = chord
+        sc = (s_c / max(float(s_c[-1]), 1e-9))
+        ch2 = np.stack([np.interp(s_norm, sc, sc), np.interp(s_norm, sc, th_c)], axis=1)
+        R, t = _kabsch(ref, ch2)
+        Qhat = (R @ ch2.T).T + t
+        rms = float(np.sqrt(np.mean(np.sum((ref - Qhat)**2, axis=1))))
+        hd = _hausdorff(ref, Qhat)
+        rot_deg = float(np.degrees(np.arctan2(R[1,0], R[0,0])))
+        results.append({"file":file_path, "method":"Chord", "rms":rms, "hausdorff":hd, "rot_deg":rot_deg, "tx":float(t[0]), "ty":float(t[1])})
+    return results
+
+# --- REPLACE the whole function with this bugfixed version ---
+def compute_kabsch_over_dataset(df_all: pd.DataFrame) -> None:
+    """Run Kabsch/Procrustes metrics over all files; write CSV & JSON summary."""
+    files = [f for f in df_all["file"].dropna().tolist() if Path(f).exists()]
+    rows = []
+    for fp in files:
+        rows.extend(_kabsch_metrics_for_file(fp))
+
+    if not rows:
+        print("[WARN] No Kabsch metrics computed."); return
+
+    dfk = pd.DataFrame(rows)
+    dfk.to_csv(STATS_DIR / "kabsch_metrics.csv", index=False, encoding="utf-8-sig")
+
+    # Build a JSON-safe nested summary: {method: {metric: {mean,std,median,min,max,n}}}
+    summary: Dict[str, Dict[str, Dict[str, float]]] = {}
+    metrics = ["rms", "hausdorff", "rot_deg"]
+
+    for method, g in dfk.groupby("method"):
+        method = str(method)
+        summary[method] = {}
+        for metric in metrics:
+            vals = pd.to_numeric(g[metric], errors="coerce").dropna().to_numpy(dtype=float)
+            if vals.size == 0:
+                # If no valid numbers for this metric, store None
+                summary[method][metric] = {
+                    "mean": None, "std": None, "median": None, "min": None, "max": None, "n": 0
+                }
+                continue
+            summary[method][metric] = {
+                "mean": float(np.mean(vals)),
+                "std":  float(np.std(vals, ddof=1)) if vals.size > 1 else 0.0,
+                "median": float(np.median(vals)),
+                "min": float(np.min(vals)),
+                "max": float(np.max(vals)),
+                "n":   int(vals.size),
+            }
+
+    with open(STATS_DIR / "kabsch_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    print("[OK] Kabsch metrics ->", STATS_DIR)
+
+
 # ----------------------- Training entry -----------------------
 def run_train():
     df_tr = collect_dataset(TRAIN_DIR, "train")
@@ -985,24 +1334,45 @@ def run_train():
     plot_baseline_error_summaries(df_te, best_model, include_ml_bar=True)
     generate_baseline_theta_overlays(df_all, include_predicted=False)
 
-    # NEW: compact, paper-ready summaries (figures + CSV)
+    # Compact, paper-ready summaries (figures + CSV)
     make_paper_baseline_summary(df_te, best_model, df_all, include_ml_bar=True)
+
+    # NEW: stats tests & bootstrap CIs
+    compute_tests_and_bootstrap(df_te, best_model)
+
+    # NEW: GUM-style uncertainties
+    compute_gum_uncertainties(df_all)
+
+    # NEW: Kabsch/Procrustes metrics on θ(s) curves in (s_norm, θ) space
+    compute_kabsch_over_dataset(df_all)
 
     print(f"[OK] Figures -> {FIG_DIR} and {PAPER_FIG_DIR}")
     print(f"[OK] Model & metrics -> {OUT_DIR}")
+    print(f"[OK] Extra stats/uncertainty -> {STATS_DIR}")
 
 # ----------------------- CLI -----------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Training-only pipeline with paper-friendly baseline summaries")
+    parser = argparse.ArgumentParser(description="Training-only pipeline with paper-friendly baseline summaries + uncertainties/tests")
     parser.add_argument("--data_root", type=str, default=None, help="Folder containing train/ and test/ subfolders")
     parser.add_argument("--out_dir",   type=str, default=None,    help="Output folder (default: ./outputs)")
     parser.add_argument("--um_per_px", type=float, default=None,  help="Global pixel size in μm/px (fallback if not found in files)")
+    # Optional knobs for uncertainty
+    parser.add_argument("--u_k_rel", type=float, default=REL_K_STD, help="Relative std uncertainty for calibration factor k (Type B). Default 0.02")
+    parser.add_argument("--mc_n", type=int, default=N_MC_UNCERT, help="MC samples for uncertainty propagation (Type A/B).")
     args = parser.parse_args()
 
     if args.um_per_px is not None:
         UM_PER_PX = float(args.um_per_px)
         if UM_PER_PX <= 0: UM_PER_PX = 1.0
         print(f"[INFO] Global UM_PER_PX = {UM_PER_PX} μm/px (fallback)")
+
+    # allow runtime override of a couple of tunables
+    if args.u_k_rel is not None and args.u_k_rel > 0:
+        REL_K_STD = float(args.u_k_rel)
+        print(f"[INFO] REL_K_STD (Type B) = {REL_K_STD:.4f}")
+    if args.mc_n is not None and args.mc_n > 10:
+        N_MC_UNCERT = int(args.mc_n)
+        print(f"[INFO] N_MC_UNCERT (MC) = {N_MC_UNCERT}")
 
     configure_paths(args.data_root, args.out_dir)
     run_train()
