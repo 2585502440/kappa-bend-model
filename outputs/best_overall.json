@@ -1,7 +1,0 @@
-{
-  "name": "PolyLinear",
-  "test_mae": 45.20724930205063,
-  "kind": "ML",
-  "inference_supported": true,
-  "note": "If kind=='Baseline', it cannot do (r,T)->θ_tip; best_model.joblib remains for inference."
-}
