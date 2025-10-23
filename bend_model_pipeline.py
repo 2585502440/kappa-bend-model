@@ -27,8 +27,7 @@ Inputs & calibration
 --------------------
 - Place your files under data_root/train/ and data_root/test/.
 - CSV/XLSX should contain either curvature columns ("Point Curvature", optional "Sign") and/or XY columns.
-- XY is always converted to μm first (unit-consistent). Pixel size is auto-inferred if possible; otherwise
-  a global fallback UM_PER_PX is used (set via --um_per_px).
+
 
 Usage
 -----
@@ -79,7 +78,7 @@ ALPHA = 0.05
 
 # NEW: Uncertainty & statistics tunables
 N_MC_UNCERT = 2000           # Monte Carlo samples for GUM-style uncertainty
-REL_K_STD = 0.02             # relative standard uncertainty for calibration factor k (Type B), e.g., 2%
+REL_K_STD = 0.0             # relative standard uncertainty for calibration factor k (Type B), e.g., 2%
 N_PERM = 20000               # permutations (sign-flips) for paired permutation tests
 
 # ----------------------- Paths -----------------------
@@ -709,13 +708,13 @@ def run_predict_curve(ratio: float, temps: List[float], theta0_deg: float = 0.0,
         if not no_individual_plots:
             fig = plt.figure(figsize=(6,4.2), dpi=150)
             plt.plot(s_abs, theta_deg, lw=2)
-            plt.xlabel("Arc length s (absolute units)"); plt.ylabel("Tangent angle θ(s) [deg]")
+            plt.xlabel("Arc length s (units)"); plt.ylabel("Tangent angle θ(s) [deg]")
             plt.title(f"θ(s) — r={ratio:g}:1, T={T:g}°C"); plt.grid(True, alpha=0.3); fig.tight_layout()
             plt.savefig(theta_root/"figs"/f"theta_curve_{tag}.png"); plt.close(fig)
         overlay_curves.append((s_abs, theta_deg, f"r={ratio:g}:1, T={T:g}°C"))
     fig = plt.figure(figsize=(7,4.5), dpi=150)
     for s_abs, theta_deg, lbl in overlay_curves: plt.plot(s_abs, theta_deg, lw=2, label=lbl)
-    plt.xlabel("Arc length s (absolute units)"); plt.ylabel("Tangent angle θ(s) [deg]")
+    plt.xlabel("Arc length s (units)"); plt.ylabel("Tangent angle θ(s) [deg]")
     plt.title(f"θ(s) overlay — ratio {ratio:g}:1"); plt.grid(True, alpha=0.3)
     if len(overlay_curves) > 1: plt.legend()
     plt.tight_layout(); plt.savefig(theta_root/"figs"/f"theta_overlay_r{ratio:g}.png"); plt.close(fig)
@@ -1141,6 +1140,8 @@ def _mc_calibration_theta(kappa: np.ndarray, s: np.ndarray, rel_std: float = REL
     Type B: calibration factor k uncertainty. Sample k ~ N(1, rel_std), scale s' = k*s and integrate.
     Returns std of θ_tip (deg).
     """
+    if rel_std <= 0 or n_mc <= 0:
+        return 0.0
     rng = np.random.default_rng(RANDOM_SEED+1)
     thetas = []
     for _ in range(n_mc):
@@ -1357,7 +1358,7 @@ if __name__ == "__main__":
     parser.add_argument("--out_dir",   type=str, default=None,    help="Output folder (default: ./outputs)")
     parser.add_argument("--um_per_px", type=float, default=None,  help="Global pixel size in μm/px (fallback if not found in files)")
     # Optional knobs for uncertainty
-    parser.add_argument("--u_k_rel", type=float, default=REL_K_STD, help="Relative std uncertainty for calibration factor k (Type B). Default 0.02")
+    parser.add_argument("--u_k_rel", type=float, default=REL_K_STD, help="Relative std uncertainty for calibration factor k (Type B). Default 0.0")
     parser.add_argument("--mc_n", type=int, default=N_MC_UNCERT, help="MC samples for uncertainty propagation (Type A/B).")
     args = parser.parse_args()
 
@@ -1376,3 +1377,119 @@ if __name__ == "__main__":
 
     configure_paths(args.data_root, args.out_dir)
     run_train()
+
+# ----------------------- Curvature figures (train/test; unitless) -----------------------
+from typing import Optional, List, Dict, Tuple
+
+# The following feature is additive: it does not modify existing training/evaluation logic.
+# It generates κ(s) overlay plots and CSVs for train/ and test/ splits under OUT_DIR/curvature/.
+# Axis labels and CSV headers are unitless ("s", "kappa"), and per-file plots mirror the source
+# relative paths inside outputs for easy cross-reference.
+
+def _curv_collect_rows(split_dir: Path, fallback_um_per_px: float) -> Tuple[List[Dict], List[str]]:
+    rows: List[Dict] = []
+    notes: List[str] = []
+    files = list(split_dir.rglob("*.csv")) + list(split_dir.rglob("*.xlsx"))
+    for fp in files:
+        try:
+            df = _read_table(fp)
+            kappa, s = _signed_kappa_and_s(df)  # uses UM_PER_PX inside if XY missing
+            # If XY was missing, _signed_kappa_and_s already used UM_PER_PX; allow override:
+            if (s.size >= 3) and (not np.all(np.diff(s) > 0)):
+                s = np.arange(len(kappa), dtype=float) * fallback_um_per_px
+            ratio = parse_ratio_from_path(fp)
+            temp  = parse_temp_from_path(fp)
+            rows.append({
+                "file": str(fp),
+                "rel": str(fp.relative_to(split_dir)),
+                "ratio": float(ratio) if ratio is not None else None,
+                "temp_C": float(temp) if temp is not None else None,
+                "s": s - s[0],
+                "kappa": kappa
+            })
+        except Exception as e:
+            notes.append(f"[WARN] Skip {fp}: {e}")
+    return rows, notes
+
+def _curv_export_csv(rows: List[Dict], out_dir: Path, split_name: str) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    parts = []
+    for r in rows:
+        n = min(len(r["s"]), len(r["kappa"]))
+        parts.append(pd.DataFrame({
+            "file": [r["file"]]*n,
+            "rel":  [r["rel"]]*n,
+            "ratio":[r["ratio"]]*n,
+            "temp_C":[r["temp_C"]]*n,
+            "s": r["s"][:n],
+            "kappa": r["kappa"][:n],
+        }))
+    if parts:
+        df = pd.concat(parts, ignore_index=True)
+        df.to_csv(out_dir / f"curvature_all_{split_name}.csv", index=False, encoding="utf-8-sig")
+
+def _curv_plot_overlay(rows: List[Dict], out_dir: Path, split_name: str) -> None:
+    if not rows:
+        print(f"[WARN] No curvature curves for split={split_name}."); return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(7.2, 4.6), dpi=150)
+    for r in rows:
+        lbl = r.get("rel", Path(r["file"]).name)
+        plt.plot(r["s"], r["kappa"], lw=1.3, alpha=0.85, label=lbl)
+    plt.xlabel("s"); plt.ylabel("kappa")
+    plt.title(f"Curvature overlay ({split_name})")
+    if len(rows) <= 15: plt.legend(fontsize=8, frameon=False)
+    plt.grid(True, alpha=0.3); fig.tight_layout()
+    plt.savefig(out_dir / f"curvature_overlay_{split_name}.png"); plt.close(fig)
+
+def _curv_save_per_file(rows: List[Dict], out_dir: Path, split_name: str) -> None:
+    root = out_dir / f"per_file_{split_name}"
+    root.mkdir(parents=True, exist_ok=True)
+    for r in rows:
+        fig = plt.figure(figsize=(5.2, 3.6), dpi=150)
+        plt.plot(r["s"], r["kappa"], lw=1.6)
+        plt.xlabel("s"); plt.ylabel("kappa")
+        lbl = r.get("rel", Path(r["file"]).name)
+        ratio = r.get("ratio"); temp = r.get("temp_C")
+        title = lbl
+        if ratio is not None or temp is not None:
+            title = f"{lbl} — r={ratio if ratio is not None else '?'}:1, T={temp if temp is not None else '?'}"
+        plt.title(title); plt.grid(True, alpha=0.3); fig.tight_layout()
+        # Mirror the relative path under outputs
+        dst_dir = root / Path(lbl).parent
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        fname = Path(lbl).name
+        fname = Path(fname).with_suffix(".png")
+        plt.savefig(dst_dir / fname); plt.close(fig)
+
+def run_curvature_plots(per_file: bool = True, um_per_px: Optional[float] = None) -> None:
+    """Generate unitless κ(s) overlays/CSVs for train/ and test/ under OUT_DIR/curvature/ (additive feature)."""
+    base = OUT_DIR / "curvature"
+    fig_dir = base / "figs"; csv_dir = base / "csv"; paths_dir = base / "paths"
+    for d in (fig_dir, csv_dir, paths_dir): d.mkdir(parents=True, exist_ok=True)
+    fallback = float(um_per_px) if um_per_px is not None else float(UM_PER_PX)
+
+    for split_name, split_dir in [("train", TRAIN_DIR), ("test", TEST_DIR)]:
+        if not split_dir.exists():
+            print(f"[WARN] {split_name}/ not found under {DATA_ROOT}, skip."); continue
+        rows, notes = _curv_collect_rows(split_dir, fallback)
+        for m in notes: print(m)
+        _curv_export_csv(rows, csv_dir, split_name)
+        _curv_plot_overlay(rows, fig_dir, split_name)
+        if per_file: _curv_save_per_file(rows, fig_dir, split_name)
+        # Save paths list for traceability
+        files = sorted([str(fp.relative_to(DATA_ROOT)) for fp in split_dir.rglob("*.csv")] +
+                       [str(fp.relative_to(DATA_ROOT)) for fp in split_dir.rglob("*.xlsx")])
+        with open(paths_dir / f"{split_name}_paths.txt", "w", encoding="utf-8") as f:
+            for it in files: f.write(it + "\n")
+
+# Register an atexit hook so this runs after training, without touching existing CLI/flow.
+import atexit
+def _curvature_atexit():
+    try:
+        run_curvature_plots(per_file=True, um_per_px=UM_PER_PX)
+        print("[OK] Curvature figures ->", OUT_DIR / "curvature" / "figs")
+        print("[OK] Curvature CSV ->", OUT_DIR / "curvature" / "csv")
+    except Exception as e:
+        print(f"[WARN] Curvature plotting skipped: {e}")
+atexit.register(_curvature_atexit)
