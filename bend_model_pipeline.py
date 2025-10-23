@@ -1493,3 +1493,129 @@ def _curvature_atexit():
     except Exception as e:
         print(f"[WARN] Curvature plotting skipped: {e}")
 atexit.register(_curvature_atexit)
+
+# ----------------------- Reconstruction from θ(s) (PNG only) -----------------------
+# Additive feature: reconstruct (x,y) from a results CSV containing s and θ(s).
+# This mirrors the standalone utility we use elsewhere (PNG only; no extra CSVs),
+# and saves outputs under OUT_DIR/reconstruction/figs. Original XY (if present)
+# are overlaid after shifting to start at (0,0).
+
+def _recon_pick_col(df: pd.DataFrame, cands: List[str]) -> Optional[str]:
+    """Pick the first column name from candidates (case/format tolerant)."""
+    norm = {c.lower().strip(): c for c in df.columns}
+    def simp(s: str) -> str:
+        return (s.lower()
+                .replace("(", " ").replace(")", " ")
+                .replace("-", " ").replace("_", " ")
+                .replace("/", " ").replace(".", " ").replace(",", " ")
+                .strip())
+    fuzz = {simp(c): c for c in df.columns}
+    for cand in cands:
+        key = cand.lower().strip()
+        if key in norm: return norm[key]
+    for cand in cands:
+        key = simp(cand)
+        if key in fuzz: return fuzz[key]
+    return None
+
+def reconstruct_from_results_csv(path: str, save_dir: Optional[str] = None) -> Optional[Path]:
+    """
+    Read a CSV with (s, θ_deg) and reconstruct XY via:
+      dx = ds * cos(θ),  dy = ds * sin(θ).
+    If original XY are present, also overlay for visual comparison.
+    PNG only; saved under OUT_DIR/reconstruction/figs (or save_dir if provided).
+    """
+    try:
+        import os
+        p = Path(path)
+        if not p.exists(): 
+            print(f"[WARN] Reconstruction input not found: {path}")
+            return None
+        df = pd.read_csv(p)
+
+        # Columns for s and θ(s) (accept several variants).
+        s_col = _recon_pick_col(df, ["s", "s_abs", "s_um", "arc_length", "arc length s um", "arc_length_s_um"])
+        th_col = _recon_pick_col(df, ["theta_deg", "theta (deg)", "theta_pred_deg", "tangent angle θ (deg)", "theta"])
+        if not s_col or not th_col:
+            raise KeyError("CSV must contain columns for 's' and 'theta_deg' (or compatible headers).")
+
+        s = pd.to_numeric(df[s_col], errors="coerce").to_numpy(float)
+        theta_deg = pd.to_numeric(df[th_col], errors="coerce").to_numpy(float)
+
+        # Reconstruct relative (x, y) from θ(s), starting at (0,0)
+        theta_rad = np.radians(theta_deg)
+        ds = np.diff(s, prepend=s[0])
+        dx = ds * np.cos(theta_rad)
+        dy = ds * np.sin(theta_rad)
+        x_rec = np.cumsum(dx)
+        y_rec = np.cumsum(dy)
+
+        # Optional original XY overlay (if present)
+        x_col = _recon_pick_col(df, ["x_um", "x (um)", "x", "x_abs"])
+        y_col = _recon_pick_col(df, ["y_um", "y (um)", "y", "y_abs"])
+        has_xy = (x_col is not None and y_col is not None)
+
+        # Save figure
+        base_dir = Path(save_dir).resolve() if save_dir else (OUT_DIR / "reconstruction" / "figs")
+        base_dir.mkdir(parents=True, exist_ok=True)
+        stem = p.stem
+
+        fig = plt.figure(figsize=(5.6, 4.8), dpi=150)
+        if has_xy:
+            x0 = pd.to_numeric(df[x_col], errors="coerce").to_numpy(float)
+            y0 = pd.to_numeric(df[y_col], errors="coerce").to_numpy(float)
+            plt.plot(x0 - x0[0], y0 - y0[0], "--", label="Original (shifted to start)")
+            plt.plot(x_rec, y_rec, lw=2, label="Reconstructed from θ(s)")
+            out_png = base_dir / f"{stem}_original_vs_reconstructed.png"
+        else:
+            plt.plot(x_rec, y_rec, lw=2, label="Reconstructed from θ(s)")
+            out_png = base_dir / f"{stem}_reconstructed.png"
+
+        plt.gca().set_aspect("equal", adjustable="box")
+        plt.xlabel("x (µm)"); plt.ylabel("y (µm)")
+        plt.title("Reconstructed Curve from θ(s)")
+        plt.legend(); plt.tight_layout()
+        plt.savefig(out_png, dpi=300, bbox_inches="tight"); plt.close(fig)
+        print(f"[OK] Saved reconstruction: {out_png}")
+        return out_png
+    except Exception as e:
+        print(f"[WARN] Reconstruction failed for {path}: {e}")
+        return None
+
+def batch_reconstruct_from_dir(dir_path: str) -> None:
+    """
+    Scan a directory for candidate results CSVs and run reconstruction on each.
+    Heuristics: files under OUT_DIR/theta_curves/csv or files whose name contains
+    'kappa_to_angle' or 'theta_curve'.
+    """
+    root = Path(dir_path).resolve()
+    if not root.exists():
+        print(f"[WARN] Reconstruction dir not found: {dir_path}"); return
+    # Gather candidate CSVs
+    cands = []
+    for fp in root.rglob("*.csv"):
+        name = fp.name.lower()
+        if ("kappa_to_angle" in name) or ("theta_curve" in name) or ("theta" in name and "curve" in name):
+            cands.append(fp)
+    # Fallback: if nothing matched, try all CSVs (but cap at 50 to be safe)
+    if not cands:
+        cands = list(root.rglob("*.csv"))[:50]
+    if not cands:
+        print(f"[WARN] No reconstruction candidates under {dir_path}."); return
+    print(f"[INFO] Reconstruction: {len(cands)} candidate CSV(s) found under {dir_path}.")
+    for fp in cands:
+        reconstruct_from_results_csv(str(fp))
+
+# Register a separate atexit hook (non-invasive).
+def _reconstruction_atexit():
+    try:
+        # Prefer OUT_DIR/theta_curves/csv (if exists), else OUT_DIR
+        pref = OUT_DIR / "theta_curves" / "csv"
+        target = pref if pref.exists() else OUT_DIR
+        batch_reconstruct_from_dir(str(target))
+        print("[OK] Reconstruction PNGs ->", OUT_DIR / "reconstruction" / "figs")
+    except Exception as e:
+        print(f"[WARN] Reconstruction skipped: {e}")
+
+import atexit as _recon_atexit_mod
+_recon_atexit_mod.register(_reconstruction_atexit)
