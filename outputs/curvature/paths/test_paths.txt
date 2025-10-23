@@ -1,0 +1,5 @@
+test\E_PNIPAM_PDMS_5vs1\e_20C\e_20C.csv
+test\E_PNIPAM_PDMS_5vs1\e_30C\e_30C.csv
+test\E_PNIPAM_PDMS_5vs1\e_40C\e_40C.csv
+test\E_PNIPAM_PDMS_5vs1\e_50C\e_50C.csv
+test\E_PNIPAM_PDMS_5vs1\e_60C\e_60C.csv

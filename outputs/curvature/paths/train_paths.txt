@@ -1,0 +1,10 @@
+train\C_PNIPAM_PDMS_1vs1\c_20C\c_20C.csv
+train\C_PNIPAM_PDMS_1vs1\c_30C\c_30C.csv
+train\C_PNIPAM_PDMS_1vs1\c_40C\c_40C.csv
+train\C_PNIPAM_PDMS_1vs1\c_50C\c_50C.csv
+train\C_PNIPAM_PDMS_1vs1\c_60C\c_60C.csv
+train\D_PNIPAM_PDMS_3vs1\d_20C\d_20C.csv
+train\D_PNIPAM_PDMS_3vs1\d_30C\d_30C.csv
+train\D_PNIPAM_PDMS_3vs1\d_40C\d_40C.csv
+train\D_PNIPAM_PDMS_3vs1\d_50C\d_50C.csv
+train\D_PNIPAM_PDMS_3vs1\d_60C\d_60C.csv
