@@ -832,6 +832,33 @@ def _bootstrap_ci(values: np.ndarray, n_boot: int = N_BOOT, alpha: float = ALPHA
     high = float(np.percentile(boots, 100 * (1 - alpha / 2.0)))
     return low, high
 
+# ---- Fisher-z CI for Pearson r, plus R^2 point ----
+def _fisher_r_ci_from_pairs(y_true: np.ndarray, y_pred: np.ndarray, alpha: float = ALPHA):
+    """
+    Return dict with r point, (lo, hi) Fisher-z CI, and R^2 point only.
+    Uses only numpy; valid for n>=4.
+    """
+    y_true = np.asarray(y_true, float)
+    y_pred = np.asarray(y_pred, float)
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    yt, yp = y_true[mask], y_pred[mask]
+    n = yt.size
+    if n < 4:
+        return {"r": float("nan"), "r_lo": float("nan"), "r_hi": float("nan"),
+                "R2_point": float("nan"), "n": int(n)}
+    # Pearson r
+    r = float(np.corrcoef(yt, yp)[0, 1])
+    R2_point = float(r2_score(yt, yp))
+    # Fisher z
+    r_clip = np.clip(r, -0.999999, 0.999999)
+    z = np.arctanh(r_clip)
+    se = 1.0 / np.sqrt(n - 3.0)
+    zcrit = 1.959963984540054  # ~ N(0,1) 97.5%
+    zL, zU = z - zcrit * se, z + zcrit * se
+    rL, rU = float(np.tanh(zL)), float(np.tanh(zU))
+    return {"r": r, "r_lo": rL, "r_hi": rU, "R2_point": R2_point, "n": int(n)}
+
+
 def plot_baseline_error_summaries(df_te: pd.DataFrame, best_model, include_ml_bar: bool = True) -> None:
     """(Kept from previous version) — boxplot + Bland–Altman for test set."""
     feats = ["ratio","ratio_frac","temp_C"]
@@ -993,6 +1020,52 @@ def make_paper_baseline_summary(df_te: pd.DataFrame, best_model, df_all: pd.Data
     if deltas_poly is None and deltas_ch is None:
         print("[WARN] No valid θ(s) deltas for aggregation."); return
 
+    # MAE_circ with 95% bootstrap CI (angles wrapped to [-180, 180] deg) -----
+    def _valid_err_circ(y):
+        m = np.isfinite(y_true) & np.isfinite(y)
+        # circular absolute error in degrees
+        return np.abs(_ang_diff_deg(y[m], y_true[m]))
+
+    err_ch_c = _valid_err_circ(y_ch)
+    err_po_c = _valid_err_circ(y_po)
+
+    bars_c, ci_low_c, ci_high_c, labels_c = [], [], [], []
+    if err_ch_c.size > 0:
+        labels_c.append("Chord")
+        bars_c.append(float(np.mean(err_ch_c)))
+        lo, hi = _bootstrap_ci(err_ch_c); ci_low_c.append(bars_c[-1]-lo); ci_high_c.append(hi-bars_c[-1])
+    if err_po_c.size > 0:
+        labels_c.append("Polyline")
+        bars_c.append(float(np.mean(err_po_c)))
+        lo, hi = _bootstrap_ci(err_po_c); ci_low_c.append(bars_c[-1]-lo); ci_high_c.append(hi-bars_c[-1])
+    if include_ml_bar:
+        y_ml = best_model.predict(df_te[feats])
+        err_ml_c = _valid_err_circ(y_ml)
+        if err_ml_c.size > 0:
+            labels_c.append("ML")
+            bars_c.append(float(np.mean(err_ml_c)))
+            lo, hi = _bootstrap_ci(err_ml_c); ci_low_c.append(bars_c[-1]-lo); ci_high_c.append(hi-bars_c[-1])
+
+    if len(bars_c) >= 2:
+        x = np.arange(len(bars_c))
+        fig = plt.figure(figsize=(5.5,4.2), dpi=150)
+        plt.bar(x, bars_c, yerr=[ci_low_c, ci_high_c], capsize=4)
+        plt.xticks(x, labels_c)
+        plt.ylabel("MAE_circ (deg)")
+        plt.title("Baseline comparison (MAE_circ ± 95% CI, TEST)")
+        plt.tight_layout()
+        plt.savefig(PAPER_FIG_DIR / "baseline_mae_ci_circular.png")
+        plt.close(fig)
+
+        # reproducibility export
+        summary_c = {labels_c[i]: {"mae_circ": bars_c[i],
+                                   "ci_low": bars_c[i]-ci_low_c[i],
+                                   "ci_high": bars_c[i]+ci_high_c[i]} for i in range(len(labels_c))}
+        with open(PAPER_CSV_DIR / "summary_circular.json", "w", encoding="utf-8") as f:
+            json.dump(summary_c, f, indent=2, ensure_ascii=False)
+    else:
+        print("[WARN] Not enough methods to draw MAE_circ CI bar chart.")
+
     fig = plt.figure(figsize=(7.2,4.6), dpi=150)
     if deltas_poly is not None and deltas_poly.shape[0] >= 1:
         m = np.nanmean(deltas_poly, axis=0)
@@ -1034,32 +1107,120 @@ def _paired_permutation_pvalue(a_vals: np.ndarray, b_vals: np.ndarray, n_perm: i
     p = float((np.sum(np.abs(null_means) >= obs) + 1) / (n_perm + 1))
     return p
 
-def _bootstrap_metric_cis(y_true: np.ndarray, y_pred: np.ndarray, n_boot: int = N_BOOT, alpha: float = ALPHA, seed: int = RANDOM_SEED) -> Dict[str, Dict[str, float]]:
-    """Bootstrap CIs for MAE / RMSE / R2."""
+# --- Angle difference in degrees, folded to [-180, 180] ---
+def _ang_diff_deg(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
+    """
+    Circular difference in degrees.
+    Returns (pred - true) wrapped to [-180, 180].
+    Safe for scalars or NumPy arrays (broadcastable).
+    """
+    pred = np.asarray(pred, float)
+    true = np.asarray(true, float)
+    return (pred - true + 180.0) % 360.0 - 180.0
+
+def _bootstrap_metric_cis(y_true: np.ndarray, y_pred: np.ndarray,
+                          n_boot: int = N_BOOT, alpha: float = ALPHA, seed: int = RANDOM_SEED) -> Dict[str, Dict[str, float]]:
+    """
+    Plan A: Bootstrap CIs for MAE / RMSE only; for R^2 report point estimate only,
+    and report Fisher-z 95% CI for Pearson r (not mapped to R^2).
+    """
     y_true = np.asarray(y_true, float); y_pred = np.asarray(y_pred, float)
     mask = np.isfinite(y_true) & np.isfinite(y_pred)
     yt, yp = y_true[mask], y_pred[mask]
     if yt.size < 2:
-        return {"MAE":{"mean":float("nan"),"lo":float("nan"),"hi":float("nan")},
-                "RMSE":{"mean":float("nan"),"lo":float("nan"),"hi":float("nan")},
-                "R2":{"mean":float("nan"),"lo":float("nan"),"hi":float("nan")}}
+        return {
+            "MAE": {"mean": float("nan"), "lo": float("nan"), "hi": float("nan")},
+            "RMSE": {"mean": float("nan"), "lo": float("nan"), "hi": float("nan")},
+            "R2_point": float("nan"),
+            "r": {"point": float("nan"), "lo": float("nan"), "hi": float("nan"), "n": int(yt.size)}
+        }
+
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, yt.size, size=(n_boot, yt.size))
-    mae = np.mean(np.abs(yp - yt))
-    rmse = math.sqrt(np.mean((yp - yt)**2))
-    r2 = r2_score(yt, yp)
+
+    mae = float(np.mean(np.abs(yp - yt)))
+    rmse = float(np.sqrt(np.mean((yp - yt) ** 2)))
+    # R^2 点估计 + r 的 Fisher-z 区间
+    r_stats = _fisher_r_ci_from_pairs(yt, yp, alpha=alpha)
+
+    # Bootstrap CI(MAE / RMSE)
     maes = np.mean(np.abs(yp[idx] - yt[idx]), axis=1)
-    rmses = np.sqrt(np.mean((yp[idx] - yt[idx])**2, axis=1))
-    # R² bootstrap by resampling pairs
-    r2s = np.array([r2_score(yt[i], yp[i]) for i in idx])
+    rmses = np.sqrt(np.mean((yp[idx] - yt[idx]) ** 2, axis=1))
+
     def CI(arr):
-        lo = float(np.percentile(arr, 100 * (alpha/2)))
-        hi = float(np.percentile(arr, 100 * (1 - alpha/2)))
+        lo = float(np.percentile(arr, 100 * (alpha / 2)))
+        hi = float(np.percentile(arr, 100 * (1 - alpha / 2)))
         return lo, hi
-    lo_mae, hi_mae = CI(maes); lo_rmse, hi_rmse = CI(rmses); lo_r2, hi_r2 = CI(r2s)
-    return {"MAE":{"mean":float(mae),"lo":lo_mae,"hi":hi_mae},
-            "RMSE":{"mean":float(rmse),"lo":lo_rmse,"hi":hi_rmse},
-            "R2":{"mean":float(r2),"lo":lo_r2,"hi":hi_r2}}
+
+    lo_mae, hi_mae = CI(maes)
+    lo_rmse, hi_rmse = CI(rmses)
+
+    return {
+        "MAE": {"mean": mae, "lo": lo_mae, "hi": hi_mae},
+        "RMSE": {"mean": rmse, "lo": lo_rmse, "hi": hi_rmse},
+        "R2_point": r_stats["R2_point"],
+        "r": {"point": r_stats["r"], "lo": r_stats["r_lo"], "hi": r_stats["r_hi"], "n": r_stats["n"]}
+    }
+
+def _bootstrap_metric_cis_circular(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    n_boot: int = N_BOOT,
+    alpha: float = ALPHA,
+    seed: int = RANDOM_SEED,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Circular-error variant of the metric bootstrap:
+    - MAE_circ / RMSE_circ are computed on angular differences
+      wrapped to [-180, 180] deg.
+    - R2_point and Fisher-z CI for Pearson r are computed on the
+      raw (y_true, y_pred) pairs to keep comparability with the
+      non-circular report (Plan A: R^2 point only; CI for r).
+    """
+    y_true = np.asarray(y_true, float)
+    y_pred = np.asarray(y_pred, float)
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    yt, yp = y_true[mask], y_pred[mask]
+
+    if yt.size < 2:
+        return {
+            "MAE_circ": {"mean": float("nan"), "lo": float("nan"), "hi": float("nan")},
+            "RMSE_circ": {"mean": float("nan"), "lo": float("nan"), "hi": float("nan")},
+            "R2_point": float("nan"),
+            "r": {"point": float("nan"), "lo": float("nan"), "hi": float("nan"), "n": int(yt.size)},
+        }
+
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, yt.size, size=(n_boot, yt.size))
+
+    # Point estimates on circular errors
+    e = _ang_diff_deg(yp, yt)
+    mae_c = float(np.mean(np.abs(e)))
+    rmse_c = float(np.sqrt(np.mean(e ** 2)))
+
+    # Bootstrap CIs for circular MAE/RMSE
+    e_boot = _ang_diff_deg(yp[idx], yt[idx])  # shape (B, n)
+    maes = np.mean(np.abs(e_boot), axis=1)
+    rmses = np.sqrt(np.mean(e_boot ** 2, axis=1))
+
+    def _ci(arr: np.ndarray) -> Tuple[float, float]:
+        lo = float(np.percentile(arr, 100 * (alpha / 2)))
+        hi = float(np.percentile(arr, 100 * (1 - alpha / 2)))
+        return lo, hi
+
+    lo_mae, hi_mae = _ci(maes)
+    lo_rmse, hi_rmse = _ci(rmses)
+
+    # Keep the same scheme for R2 point and r Fisher-z CI (on raw pairs)
+    r_stats = _fisher_r_ci_from_pairs(yt, yp, alpha=alpha)
+
+    return {
+        "MAE_circ": {"mean": mae_c, "lo": lo_mae, "hi": hi_mae},
+        "RMSE_circ": {"mean": rmse_c, "lo": lo_rmse, "hi": hi_rmse},
+        "R2_point": r_stats["R2_point"],
+        "r": {"point": r_stats["r"], "lo": r_stats["r_lo"], "hi": r_stats["r_hi"], "n": r_stats["n"]},
+    }
+
 
 def compute_tests_and_bootstrap(df_te: pd.DataFrame, best_model) -> None:
     """Compute paired permutation p-values and bootstrap CIs; save under outputs/stats/"""
@@ -1077,6 +1238,17 @@ def compute_tests_and_bootstrap(df_te: pd.DataFrame, best_model) -> None:
         "Chord": _bootstrap_metric_cis(y_true, y_ch),
         "Polyline": _bootstrap_metric_cis(y_true, y_po)
     }
+
+    # Also write circular-error metrics (angles wrapped to [-180, 180] deg).
+    out_ci_circ = {
+        "ML": _bootstrap_metric_cis_circular(y_true, y_ml, n_boot=N_BOOT, alpha=ALPHA, seed=RANDOM_SEED),
+        "Chord": _bootstrap_metric_cis_circular(y_true, y_ch, n_boot=N_BOOT, alpha=ALPHA, seed=RANDOM_SEED),
+        "Polyline": _bootstrap_metric_cis_circular(y_true, y_po, n_boot=N_BOOT, alpha=ALPHA, seed=RANDOM_SEED),
+    }
+
+    with open(STATS_DIR / "bootstrap_metrics_ci_circular.json", "w", encoding="utf-8") as f:
+        json.dump(out_ci_circ, f, indent=2, ensure_ascii=False)
+
     with open(STATS_DIR / "bootstrap_metrics_ci.json", "w", encoding="utf-8") as f:
         json.dump(out_ci, f, indent=2, ensure_ascii=False)
 
@@ -1528,7 +1700,7 @@ def reconstruct_from_results_csv(path: str, save_dir: Optional[str] = None) -> O
     try:
         import os
         p = Path(path)
-        if not p.exists(): 
+        if not p.exists():
             print(f"[WARN] Reconstruction input not found: {path}")
             return None
         df = pd.read_csv(p)
@@ -1619,3 +1791,4 @@ def _reconstruction_atexit():
 
 import atexit as _recon_atexit_mod
 _recon_atexit_mod.register(_reconstruction_atexit)
+
